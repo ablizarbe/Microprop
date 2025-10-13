@@ -1,7 +1,38 @@
 import numpy as np
 from scipy.optimize import brentq
 import pandas as pd
+from scipy.interpolate import interp1d
 from CoolProp.CoolProp import PropsSI
+
+class SerpentineCorrelation:
+    def __init__(self, eNu_file='eNu_data.csv', ef_file='ef_data.csv'):
+        try:
+            # Load data using pandas
+            eNu_data = pd.read_csv(eNu_file)
+            ef_data = pd.read_csv(ef_file)
+
+            # Create interpolation functions
+            self.eNu_interp = interp1d(eNu_data['Reynolds'], eNu_data['eNu'], bounds_error=False, fill_value="extrapolate")
+            self.ef_interp = interp1d(ef_data['Reynolds'], ef_data['ef'], bounds_error=False, fill_value="extrapolate")
+
+            if DEBUG:
+                print("Successfully loaded and initialized serpentine correlations.")
+
+        except FileNotFoundError as e:
+            print(f"Error: Correlation file not found: {e}. Please ensure '{eNu_file}' and '{ef_file}' are in the same directory.")
+            # Fallback to default values if files are not found
+            self.eNu_interp = lambda x: 1.0
+            self.ef_interp = lambda x: 1.0
+        except Exception as e:
+            print(f"An error occurred during correlation initialization: {e}")
+            self.eNu_interp = lambda x: 1.0
+            self.ef_interp = lambda x: 1.0
+
+    def get_enhancement_factors(self, Re):
+        """
+        Returns the enhancement factors eNu and ef for a given Reynolds number.
+        """
+        return self.eNu_interp(Re), self.ef_interp(Re)
 
 # Try to import exact Shah & London table accessor (user-provided)
 # must implement: get_Nu(r_star, sector_angle) -> Nu (constant-q)
@@ -181,6 +212,9 @@ def march_annulus_multichannel(mdot_total, P_in, r_in, r_out, A_module, W_total,
     # Total wetted perimeter for all channels (m per channel * n_channels)
     P_wet_total = P_wet_channel * n_channels
 
+    # Instantiate the correlation helper
+    correlation_helper = SerpentineCorrelation()
+
     # iterate slices
     for i in range(N):
         curr_P = P[i]
@@ -201,8 +235,12 @@ def march_annulus_multichannel(mdot_total, P_in, r_in, r_out, A_module, W_total,
         u_m = mdot_channel / (rho_m * A_cs) if (rho_m * A_cs) > 0 else 0.0
         Re_m = rho_m * u_m * D_h / mu_m if mu_m > 0 else 0.0
 
-        # friction (simple laminar fallback)
-        f = 64.0 / Re_m if Re_m > 1e-12 else 1e12
+        # Get enhancement factors from the correlation helper
+        eNu, ef = correlation_helper.get_enhancement_factors(Re_m)
+
+        # friction factor calculation for serpentine channels
+        f_s = 64.0 / Re_m if Re_m > 1e-12 else 1e12
+        f = ef * f_s
         dP_dx = -f * rho_m * u_m**2 / (2.0 * D_h)
 
         # CHF baseline (use per-channel G when computing Bo_crit, but qpp_chf is per heater area)
@@ -220,9 +258,9 @@ def march_annulus_multichannel(mdot_total, P_in, r_in, r_out, A_module, W_total,
         # convert to flux per heater area: (W/m_axial) / a_per_length = qpp_chf_per_wetted * (P_wet_total / a_per_length)
         qpp_chf = qpp_chf_per_wetted * (P_wet_total / a_per_length) if a_per_length > 0 else 0.0
 
-        # Nusselt from Shah & London table (using r*=r_in/r_out and sector_angle placeholder)
-        rstar = r_in / r_out
-        Nu = Nu_annulus_constq(rstar, sector_angle)
+        # Nusselt number calculation for serpentine channels
+        Nu_straight = 4.36  # Baseline for straight circular pipe with uniform heat flux
+        Nu = eNu * Nu_straight
         h_l_curr = max(1e-12, Nu * k_l / D_h)
 
         # convective conductance per heater area uses total wetted perimeter and heater area per length:
@@ -295,7 +333,7 @@ def march_annulus_multichannel(mdot_total, P_in, r_in, r_out, A_module, W_total,
             E_in = E_latent
         else:
             # all vapor (superheated)
-            Nu_v = Nu_annulus_constq(rstar, sector_angle)
+            Nu_v = eNu * 4.36
             h_v_curr = max(1e-12, Nu_v * k_v / D_h)
             conv_cond_v_per_heater_area = h_v_curr * (P_wet_total / a_per_length)
             qpp_v_heaterbasis = min(qpp_heater_global,
@@ -334,7 +372,7 @@ def march_annulus_multichannel(mdot_total, P_in, r_in, r_out, A_module, W_total,
             print(f"         E_in={E_in:.3e} W, E_need={E_needed_to_sat:.3e} W, phase={phase}, T={curr_T:.2f}->{T_b[i+1]:.2f}, alpha={alpha[i+1]:.3f}")
 
     # total absorbed heat (W) across all heater area and axial integration
-    Q_total = a_per_length * np.trapz(qpp_arr, x[:-1])
+    Q_total = a_per_length * np.trapezoid(qpp_arr, x[:-1])
     return x, T_b, P, alpha, Q_total
 
 # -------------------------
