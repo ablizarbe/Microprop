@@ -77,7 +77,7 @@ cp_v = 2080.0
 h_fg = 2.257e6
 R_c = 1e-3  # curvature radius
 
-DEBUG = True
+DEBUG = False
 
 # -------------------------
 # Geometry helpers (annulus)
