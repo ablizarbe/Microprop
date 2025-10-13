@@ -34,14 +34,6 @@ class SerpentineCorrelation:
         """
         return self.eNu_interp(Re), self.ef_interp(Re)
 
-# Try to import exact Shah & London table accessor (user-provided)
-# must implement: get_Nu(r_star, sector_angle) -> Nu (constant-q)
-try:
-    from shah_london_table import get_Nu as shah_get_Nu
-    _HAS_SHAH = True
-except Exception:
-    shah_get_Nu = None
-    _HAS_SHAH = False
 
 # -------------------------
 # USER / MATERIAL SETTINGS
@@ -126,20 +118,6 @@ def Nu_annulus_constq_fallback(r_star, sector_angle=None):
         return float(nus[-1])
     return float(np.interp(rstar, etas, nus))
 
-def Nu_annulus_constq(r_star, sector_angle=None):
-    """
-    Wrapper: prefer user-provided shah_get_Nu(r_star, sector_angle), else fallback.
-    Note: shah_get_Nu expects r* and sector_angle as you described.
-    """
-    if shah_get_Nu is not None:
-        try:
-            return float(shah_get_Nu(r_star, sector_angle))
-        except Exception as e:
-            if DEBUG:
-                print("shah_get_Nu failed, falling back to internal table:", e)
-            return Nu_annulus_constq_fallback(r_star, sector_angle)
-    else:
-        return Nu_annulus_constq_fallback(r_star, sector_angle)
 
 # -------------------------
 # Heaters by voltage
