@@ -1,0 +1,433 @@
+import numpy as np
+from scipy.optimize import brentq
+import pandas as pd
+from CoolProp.CoolProp import PropsSI
+
+# Try to import exact Shah & London table accessor (user-provided)
+# must implement: get_Nu(r_star, sector_angle) -> Nu (constant-q)
+try:
+    from shah_london_table import get_Nu as shah_get_Nu
+    _HAS_SHAH = True
+except Exception:
+    shah_get_Nu = None
+    _HAS_SHAH = False
+
+# -------------------------
+# USER / MATERIAL SETTINGS
+# -------------------------
+# Two cases (large, small) as requested:
+As_list = [5.4e-6, 5.16e-6]      # total heater area (m^2) - large, small (heater footprint)
+r_in_list = [54e-6, 20e-6]       # inner radius (m)
+r_out_list = [266e-6, 60e-6]     # outer radius (m)
+
+# Fixed length (you specified): 8.96 mm
+L_fixed = 8.96e-3  # m
+
+
+
+# Number of parallel channels
+n_channels = 5
+
+# Heater resistances (ohms)
+R_heater_1 = 3.40
+R_heater_2 = 2.38
+
+# Heater wall temperature (kept for conduction model)
+T_w = 473.0  # K
+
+# Si / SiN conductivities (defaults; you can override)
+k_si_default = 148.0    # W/mK (bulk Si at room temperature ~148)
+k_sin_default = 2.0     # W/mK (LPCVD SiN typical thin-film estimate; process-dependent)
+t_sin_default = 500e-9  # m (500 nm as corrected)
+
+# Physical properties (kept from your original file)
+g = 9.81
+sigma = 0.059
+R_v = 461.5
+rho_l = 958.0
+mu_l = 2.82e-4
+k_l = 0.68
+cp_l = 4216.0
+mu_v = 1.26e-5
+k_v = 0.024
+cp_v = 2080.0
+h_fg = 2.257e6
+R_c = 1e-3  # curvature radius
+
+DEBUG = True
+
+# -------------------------
+# Geometry helpers (annulus)
+# -------------------------
+def channel_geom_from_radii(r_in, r_out):
+    """Annular cross-section geometry (per single channel)."""
+    if r_out <= r_in:
+        raise ValueError("r_out must be > r_in")
+    A_cs = np.pi * (r_out**2 - r_in**2)           # cross-sectional area (m^2) per channel
+    P_wet = 2.0 * np.pi * (r_out + r_in)          # wetted perimeter (m) per channel (inner+outer)
+    D_h = 4.0 * A_cs / P_wet                      # hydraulic diameter per channel
+    return A_cs, P_wet, D_h
+
+# -------------------------
+# Fallback Nu (if shah table missing)
+# -------------------------
+def Nu_annulus_constq_fallback(r_star, sector_angle=None):
+    """
+    Placeholder approximate values for Nu(constant q) vs r* = r_in/r_out.
+    This is only used if shah_london_table.get_Nu is not available.
+    """
+    NU_TABLE = {
+        0.00: 4.36,    # approximate circular-tube-like baseline for r*=0
+        0.10: 4.50,
+        0.20: 4.70,
+        0.333333: 5.10,
+        0.50: 5.50,
+        0.75: 6.50,
+        0.90: 7.50,
+        0.99: 8.20
+    }
+    etas = np.array(sorted(NU_TABLE.keys()))
+    nus = np.array([NU_TABLE[e] for e in etas])
+    rstar = float(r_star)
+    if rstar <= etas[0]:
+        return float(nus[0])
+    if rstar >= etas[-1]:
+        return float(nus[-1])
+    return float(np.interp(rstar, etas, nus))
+
+def Nu_annulus_constq(r_star, sector_angle=None):
+    """
+    Wrapper: prefer user-provided shah_get_Nu(r_star, sector_angle), else fallback.
+    Note: shah_get_Nu expects r* and sector_angle as you described.
+    """
+    if shah_get_Nu is not None:
+        try:
+            return float(shah_get_Nu(r_star, sector_angle))
+        except Exception as e:
+            if DEBUG:
+                print("shah_get_Nu failed, falling back to internal table:", e)
+            return Nu_annulus_constq_fallback(r_star, sector_angle)
+    else:
+        return Nu_annulus_constq_fallback(r_star, sector_angle)
+
+# -------------------------
+# Heaters by voltage
+# -------------------------
+def heater_power_from_voltage(V, heater_id=1, both=False):
+    if both:
+        return V**2 / R_heater_1 + V**2 / R_heater_2
+    if heater_id == 1:
+        return V**2 / R_heater_1
+    elif heater_id == 2:
+        return V**2 / R_heater_2
+    else:
+        raise ValueError("heater_id must be 1 or 2 (or set both=True)")
+
+# -------------------------
+# Core march() for multiple channels
+# -------------------------
+def march_annulus_multichannel(mdot_total, P_in, r_in, r_out, A_module, W_total,
+                               L=L_fixed, n_channels=5, sector_angle=None,
+                               t_sin=t_sin_default, k_sin=k_sin_default,
+                               k_si=k_si_default, N=200):
+    """
+    mdot_total: total mass flow across all channels (kg/s)
+    r_in, r_out: radii of each annular channel (m)
+    A_module: total heater footprint area (m^2) - for all channels combined
+    W_total: total heater electrical power (W) - applied to entire heater footprint
+    L: channel length (m) fixed to 8.96 mm (user-specified)
+    n_channels: number of channels in parallel (e.g. 5)
+    sector_angle: placeholder for Shah&London (pass None for now)
+    Returns x, T_b, P, alpha, Q_total_absorbed
+    """
+
+    # Ensure L is as requested (do not compute from A_module)
+    if L is None:
+        L = L_fixed
+
+    # Per-channel geometry
+    A_cs, P_wet_channel, D_h = channel_geom_from_radii(r_in, r_out)
+
+    # Split total mdot among channels
+    mdot_channel = mdot_total / float(n_channels)
+
+    dx = L / N
+    x = np.linspace(0.0, L, N+1)
+    T_b = np.zeros(N+1)
+    P = np.zeros(N+1)
+    alpha = np.zeros(N+1)
+    qpp_arr = np.zeros(N)  # heat flux per unit heater area (W/m^2_heater) for each axial slice
+
+    # initial conditions
+    T_b[0] = 293.0
+    P[0] = P_in
+    alpha[0] = 0.0
+
+    # Heater flux per heater area (heater area = A_module total)
+    if A_module <= 0:
+        raise ValueError("A_module must be > 0")
+    qpp_heater_global = W_total / A_module   # W per m^2_heater
+
+    # Heater area per axial length (m^2_heater per m_axial)
+    a_per_length = A_module / L
+
+    # Conduction thickness for Si (you explicitly wanted t_si = r_out - r_in)
+    t_si = max(1e-12, r_out - r_in)
+
+    # Resistances per unit heater area (m^2 K / W)
+    Rpp_sin = t_sin / k_sin
+    Rpp_si = t_si / k_si
+
+    # Total wetted perimeter for all channels (m per channel * n_channels)
+    P_wet_total = P_wet_channel * n_channels
+
+    # iterate slices
+    for i in range(N):
+        curr_P = P[i]
+        curr_T = T_b[i]
+        curr_alpha = alpha[i]
+
+        # local saturation and mixture props
+        T_sat_curr = PropsSI('T', 'P', curr_P, 'Q', 0, 'Water')
+        rho_v_curr = curr_P / (R_v * T_sat_curr) if (R_v > 0 and T_sat_curr > 0) else 0.0
+        rho_m = (1.0 - curr_alpha) * rho_l + curr_alpha * rho_v_curr
+        mu_m = (1.0 - curr_alpha) * mu_l + curr_alpha * mu_v
+
+        if rho_m <= 0 or mu_m <= 0:
+            rho_m = rho_l
+            mu_m = mu_l
+
+        # velocity and Re per channel (use per-channel area)
+        u_m = mdot_channel / (rho_m * A_cs) if (rho_m * A_cs) > 0 else 0.0
+        Re_m = rho_m * u_m * D_h / mu_m if mu_m > 0 else 0.0
+
+        # friction (simple laminar fallback)
+        f = 64.0 / Re_m if Re_m > 1e-12 else 1e12
+        dP_dx = -f * rho_m * u_m**2 / (2.0 * D_h)
+
+        # CHF baseline (use per-channel G when computing Bo_crit, but qpp_chf is per heater area)
+        G_channel = mdot_channel / A_cs if A_cs > 0 else 0.0
+        Eo = g * (rho_l - rho_v_curr) * D_h**2 / sigma if sigma > 0 else 1.0
+        Bo_crit = 0.12 * np.sqrt(rho_v_curr / rho_l) * (1.0 + Eo**(-0.5)) if Eo > 0 else 0.12
+        # qpp_chf derived from per-channel G but expressed as per-heater-area limit:
+        # latent power per channel per unit axial length (W/m_axial) = Bo_crit * G_channel * h_fg * (A_heater_per_channel_per_length?)
+        # Simpler consistent approach: compute qpp_chf_per_wetted_area ~ Bo_crit * G_channel * h_fg,
+        # then convert to per-heater-area by multiplying by (P_wet_channel / a_per_length) ratio if needed.
+        # For consistency with previous code and your Bo_crit formulation, we compute qpp_chf as:
+        qpp_chf_per_wetted = Bo_crit * G_channel * h_fg   # W per m^2_wetted (approx)
+        # Convert CHF limit to per-heater-area basis (W per m^2_heater)
+        # total latent power available per axial length (W/m_axial) limited by qpp_chf_per_wetted * P_wet_total
+        # convert to flux per heater area: (W/m_axial) / a_per_length = qpp_chf_per_wetted * (P_wet_total / a_per_length)
+        qpp_chf = qpp_chf_per_wetted * (P_wet_total / a_per_length) if a_per_length > 0 else 0.0
+
+        # Nusselt from Shah & London table (using r*=r_in/r_out and sector_angle placeholder)
+        rstar = r_in / r_out
+        Nu = Nu_annulus_constq(rstar, sector_angle)
+        h_l_curr = max(1e-12, Nu * k_l / D_h)
+
+        # convective conductance per heater area uses total wetted perimeter and heater area per length:
+        conv_cond_per_heater_area = h_l_curr * (P_wet_total / a_per_length)   # [W/(m2_heater K)]
+
+        # series conduction resistance per heater area (SiN + Si + conv)
+        Rpp_total = Rpp_sin + Rpp_si + 1.0 / conv_cond_per_heater_area
+
+        # possible conductive-limited heat flux per heater area
+        qpp_possible_cond = (T_w - curr_T) / Rpp_total if Rpp_total > 0 else 0.0
+
+        # convective-only limit per heater area
+        qpp_convective_heater = conv_cond_per_heater_area * max(0.0, (T_w - curr_T))
+
+        # sensible heat available (per heater area) limited by heater, convection, conduction
+        qpp_sensible_heaterbasis = min(qpp_heater_global, qpp_convective_heater, qpp_possible_cond)
+
+        # energy (power) available in this slice (W) from heater sensible portion:
+        E_sensible = qpp_sensible_heaterbasis * a_per_length * dx   # W * (m) => W (since qpp [W/m2] * area [m2] -> W); same as before
+
+        # energy required (power) to raise all liquid in channels in slice to saturation:
+        # using mdot_total (mass flow of all channels)
+        E_needed_to_sat = mdot_total * cp_l * max(0.0, (T_sat_curr - curr_T))
+
+        # initialize branch variables
+        T_next = curr_T
+        dalpha_dx = 0.0
+        phase = 'unknown'
+        qpp_used = 0.0
+        E_in = 0.0
+
+        # Branch logic (keeps your previous structure but adapted areas & mdot_total)
+        if curr_T < T_sat_curr:
+            # single-phase sensible heating (may reach saturation)
+            if E_sensible < E_needed_to_sat:
+                DeltaT = E_sensible / (mdot_total * cp_l) if (mdot_total > 0 and cp_l > 0) else 0.0
+                T_next = curr_T + DeltaT
+                qpp_used = qpp_sensible_heaterbasis
+                phase = 'single'
+                E_in = E_sensible
+            else:
+                # reach saturation inside slice: evaporate as allowed by CHF & conduction
+                E_remain_total = E_sensible - E_needed_to_sat
+
+                # CHF-limited latent per heater-area (use qpp_chf computed earlier)
+                qpp_latent = min(qpp_heater_global, qpp_chf, qpp_possible_cond)
+
+                # latent energy available in slice (W)
+                E_latent_available = qpp_latent * a_per_length * dx
+                E_latent_used = min(E_remain_total, E_latent_available)
+
+                # update alpha using total mdot (global)
+                dalpha = E_latent_used / (mdot_total * h_fg) if (mdot_total > 0 and h_fg > 0) else 0.0
+                dalpha_dx = dalpha / dx if dx > 0 else 0.0
+                T_next = T_sat_curr
+                phase = 'boiling'
+                # qpp_used expressed per-heater-area
+                qpp_used = (E_sensible + E_latent_used) / (a_per_length * dx)
+                E_in = E_sensible + E_latent_used
+
+        elif curr_alpha < 1.0:
+            # boiling region: latent limited by CHF
+            qpp_latent = min(qpp_heater_global, qpp_chf, qpp_possible_cond)
+            E_latent = qpp_latent * a_per_length * dx
+            dalpha = E_latent / (mdot_total * h_fg) if (mdot_total > 0 and h_fg > 0) else 0.0
+            dalpha_dx = dalpha / dx if dx > 0 else 0.0
+            T_next = T_sat_curr
+            phase = 'boiling'
+            qpp_used = qpp_latent
+            E_in = E_latent
+        else:
+            # all vapor (superheated)
+            Nu_v = Nu_annulus_constq(rstar, sector_angle)
+            h_v_curr = max(1e-12, Nu_v * k_v / D_h)
+            conv_cond_v_per_heater_area = h_v_curr * (P_wet_total / a_per_length)
+            qpp_v_heaterbasis = min(qpp_heater_global,
+                                    conv_cond_v_per_heater_area * max(0.0, (T_w - curr_T)),
+                                    (T_w - curr_T) / (Rpp_sin + Rpp_si + 1.0 / conv_cond_v_per_heater_area))
+            E_v = qpp_v_heaterbasis * a_per_length * dx
+            DeltaT = E_v / (mdot_total * cp_v) if (mdot_total > 0 and cp_v > 0) else 0.0
+            T_next = curr_T + DeltaT
+            phase = 'super'
+            qpp_used = qpp_v_heaterbasis
+            E_in = E_v
+
+        # Guard against alpha > 1
+        delta_alpha = dalpha_dx * dx if dalpha_dx is not None else 0.0
+        if curr_alpha + delta_alpha > 1.0:
+            allowable = max(0.0, 1.0 - curr_alpha)
+            if allowable > 0 and (mdot_total > 0 and h_fg > 0):
+                E_latent_allowed = allowable * mdot_total * h_fg
+                E_sensible_used = min(E_sensible, E_needed_to_sat) if 'E_sensible' in locals() else 0.0
+                total_E_used = E_sensible_used + E_latent_allowed
+                qpp_used = total_E_used / (a_per_length * dx)
+                dalpha_dx = allowable / dx if dx > 0 else 0.0
+                E_in = total_E_used
+            else:
+                dalpha_dx = 0.0
+
+        qpp_arr[i] = float(qpp_used)
+
+        # update
+        alpha[i+1] = min(1.0, max(0.0, curr_alpha + (dalpha_dx * dx if dalpha_dx is not None else 0.0)))
+        T_b[i+1] = min(T_w, T_next)
+        P[i+1] = max(1e3, curr_P + dP_dx * dx)
+
+        if DEBUG and (i % max(1, N//20) == 0):
+            print(f"[i={i}] x={x[i]:.6f} m, Re={Re_m:.3g}, D_h={D_h:.3g}, qpp_used={qpp_used:.3g} W/m2_heater, qpp_chf={qpp_chf:.3g}")
+            print(f"         E_in={E_in:.3e} W, E_need={E_needed_to_sat:.3e} W, phase={phase}, T={curr_T:.2f}->{T_b[i+1]:.2f}, alpha={alpha[i+1]:.3f}")
+
+    # total absorbed heat (W) across all heater area and axial integration
+    Q_total = a_per_length * np.trapz(qpp_arr, x[:-1])
+    return x, T_b, P, alpha, Q_total
+
+# -------------------------
+# Estimate / search wrappers
+# -------------------------
+def estimate_mdot_needed_annulus(P_in, W, r_in, r_out, A_module, n_channels=5):
+    T_sat = PropsSI('T','P',P_in,'Q',0,'Water')
+    rho_v = P_in / (R_v * T_sat) if (R_v > 0 and T_sat > 0) else 0.0
+    A_cs, P_wet_channel, D_h = channel_geom_from_radii(r_in, r_out)
+    A_cs_total = A_cs * n_channels
+    Eo = g * (rho_l - rho_v) * D_h**2 / sigma if sigma > 0 else 1.0
+    Bo_crit = 0.12 * np.sqrt(rho_v / rho_l) * (1.0 + Eo**(-0.5)) if Eo > 0 else 0.12
+    qpp_heater = W / A_module
+    if Bo_crit * h_fg <= 0:
+        return np.nan, {'Bo_crit':Bo_crit, 'qpp_heater':qpp_heater}
+    G_needed = qpp_heater / (Bo_crit * h_fg)
+    mdot_needed = G_needed * A_cs_total
+    info = {'T_sat':T_sat, 'rho_v':rho_v, 'D_h':D_h, 'Eo':Eo, 'Bo_crit':Bo_crit, 'qpp_heater':qpp_heater, 'G_needed':G_needed}
+    return mdot_needed, info
+
+def find_mdot_with_check_annulus(P_in, W, r_in, r_out, A_module,
+                                 n_channels=5, mdot_min=1e-12, mdot_max=1e-3, n_samples=80, sector_angle=None):
+    mdot_est, info = estimate_mdot_needed_annulus(P_in, W, r_in, r_out, A_module, n_channels=n_channels)
+    print(f"Estimate mdot required to avoid CHF-limiting <--> mdot_needed = {mdot_est:.3e} kg/s")
+    print("Intermediate info:", info)
+
+    mdot_candidates = np.logspace(np.log10(mdot_min), np.log10(mdot_max), n_samples)
+    Qs = np.full_like(mdot_candidates, np.nan, dtype=float)
+
+    for i, m in enumerate(mdot_candidates):
+        try:
+            _,_,_,_,Q = march_annulus_multichannel(m, P_in, r_in, r_out, A_module, W, L=L_fixed, n_channels=n_channels, sector_angle=sector_angle, N=200)
+            Qs[i] = Q
+        except Exception as e:
+            Qs[i] = np.nan
+            if DEBUG:
+                print(f" march failed at mdot={m:.3e}: {e}")
+
+    if np.all(np.isnan(Qs)):
+        raise RuntimeError("All march attempts failed in sampling. Check implementation.")
+
+    Qmax = np.nanmax(Qs)
+    idx_max = int(np.nanargmax(Qs))
+    m_at_Qmax = mdot_candidates[idx_max]
+    print(f"Maximum Q achievable in sampled range = {Qmax:.4g} W at mdot = {m_at_Qmax:.3e} kg/s")
+
+    if Qmax < W * 0.999:
+        print("WARNING: heater power cannot be fully absorbed by fluid in sampled mdot range.")
+        return m_at_Qmax, {'Qmax':Qmax, 'mdot_best':m_at_Qmax}
+
+    # find root bracket
+    for k in range(len(mdot_candidates)-1):
+        f1 = Qs[k] - W
+        f2 = Qs[k+1] - W
+        if np.isnan(f1) or np.isnan(f2):
+            continue
+        if f1 == 0.0:
+            return mdot_candidates[k], {'Q':Qs[k]}
+        if f1 * f2 < 0:
+            a = mdot_candidates[k]; b = mdot_candidates[k+1]
+            sol = brentq(lambda m: march_annulus_multichannel(m, P_in, r_in, r_out, A_module, W, L=L_fixed, n_channels=n_channels, sector_angle=sector_angle)[4] - W, a, b)
+            return sol, {'Q':W}
+
+    return m_at_Qmax, {'Qmax':Qmax, 'mdot_best':m_at_Qmax}
+
+# -------------------------
+# Example run for both cases
+# -------------------------
+if __name__ == "__main__":
+    # Example: apply voltage and heater 1
+    V_applied = 7.0
+    W_heater1 = heater_power_from_voltage(V_applied, heater_id=1)
+    print("Heater powers (W): heater1=", W_heater1, " heater2=", heater_power_from_voltage(V_applied, heater_id=2),
+          " both=", heater_power_from_voltage(V_applied, both=True))
+
+    results = []
+    # sector_angle placeholder (you will supply real values later). Kept None for now.
+    sector_angle_placeholder = 180
+
+    for A_module, r_in, r_out in zip(As_list, r_in_list, r_out_list):
+        # Use L_fixed (explicit)
+        L_calc = L_fixed
+        print(f"\nCase (A_module={A_module:.3e} m2, r_in={r_in:.3e} m, r_out={r_out:.3e} m) -> L = {L_calc*1e3:.3f} mm")
+
+        # find mdot that absorbs heater1 power
+        mdot, info = find_mdot_with_check_annulus(1e5, W_heater1, r_in, r_out, A_module,
+                                                  n_channels=n_channels, mdot_min=1e-12, mdot_max=1e-3, n_samples=120,
+                                                  sector_angle=sector_angle_placeholder)
+        x, T, P_arr, alpha, Q = march_annulus_multichannel(mdot, 1e5, r_in, r_out, A_module, W_heater1,
+                                                           L=L_calc, n_channels=n_channels, sector_angle=sector_angle_placeholder, N=200)
+        results.append({'A':A_module, 'r_in':r_in, 'r_out':r_out, 'L':L_calc, 'mdot':mdot, 'Q':Q, 'alpha_exit':alpha[-1]})
+        print(" mdot found (kg/s) = ", mdot, " Q_absorbed = ", Q)
+
+    df = pd.DataFrame(results)
+    print("\nSummary:")
+    print(df.to_string(index=False))

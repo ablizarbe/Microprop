@@ -1,0 +1,402 @@
+import numpy as np
+from scipy.optimize import brentq
+import pandas as pd
+from CoolProp.CoolProp import PropsSI
+
+
+# Constants
+h_channel = 0.212e-3  # m
+w = 0.212e-3  # m
+g = 9.81  # m/s2
+sigma = 0.059  # N/m
+T_w = 473  # K
+T_in = 293  # K
+R_v = 461.5  # J/kg K for water vapor
+rho_l = 958  # kg/m3
+mu_l = 2.82e-4  # Pa s
+k_l = 0.68  # W/m K
+cp_l = 4216  # J/kg K
+mu_v = 1.26e-5  # Pa s
+k_v = 0.024  # W/m K
+cp_v = 2080  # J/kg K
+h_fg = 2.257e6  # J/kg
+R_c = 1e-3  # m, radius of curvature for serpentine bends; adjust as needed
+Pr_l = cp_l * mu_l / k_l  # Prandtl number for liquid
+Pr_v = cp_v * mu_v / k_v  # Prandtl number for vapor
+
+def debug_objective_sweep(P_in, W, w, A_module, h_channel, L):
+    print("mdot (kg/s)    Q_minus_W (W)")
+    for m in np.logspace(-12, -4, 17):
+        try:
+            _,_,_,_,Q = march(m, P_in, w, A_module, h_channel, L, W, N=200)
+            print(f"{m:.3e}    {Q - W:+.3e}   Q={Q:.3e}")
+        except Exception as e:
+            print(f"{m:.3e}    ERROR {e}")
+
+
+def T_sat_func(P):
+    # P in Pa
+    return PropsSI('T','P',P,'Q',0,'Water')   # saturation temperature in K
+
+
+def channel_geom_from_w_h(w, H):
+    """Return cross-section area, wet perimeter, hydraulic diameter."""
+    A_cs = w * H
+    P_wet = 2.0 * (w + H)
+    D_h = 4.0 * A_cs / P_wet
+    return A_cs, P_wet, D_h
+
+def hydraulic_diameter_from_wh(w, H):
+    """Hydraulic diameter for rectangular cross-section from width w and height H"""
+    A_cs = w * H
+    P_wet = 2.0 * (w + H)
+    return 4.0 * A_cs / P_wet
+
+def f_straight_darcy_rectangular(Re, H, B, n_terms=201):
+    """
+    Darcy friction factor for fully-developed laminar flow in a rectangular duct (Shah & London series).
+    Returns f_D (Darcy). If Re<=0 or series numerics fail returns np.nan.
+    """
+    if Re <= 0 or np.isnan(Re):
+        return np.nan
+    # ensure odd n_terms
+    if n_terms % 2 == 0:
+        n_terms += 1
+    S = 0.0
+    for n in range(1, n_terms, 2):
+        arg = n * np.pi * B / (2.0 * H)
+        S += (1.0 / n**5) * np.tanh(arg)
+    T = (192.0 * H) / (np.pi**5 * B) * S
+    denom = 1.0 - T
+    if denom <= 0:
+        return np.nan
+    D_h = 4.0 * (H * B) / (2.0 * (H + B))
+    fRe = 24.0 * (D_h**2 / H**2) / denom
+    return fRe / Re
+
+def Nu_fully_developed_rectangular_constTw(H, B):
+    """
+    Return fully-developed laminar Nu for constant wall temperature (Tw).
+    Interpolates canonical values approaching the parallel-plate limit Nu=7.541.
+    H = height (m), B = width (m).
+    """
+    A = H / B
+    # Reference points (A, Nu_constTw) - canonical values approaching 7.541 as A->infty
+    As = np.array([1.0, 2.0, 4.0, 8.0, 1e6])
+    Nus = np.array([2.976, 3.391, 4.439, 5.597, 7.541])
+    if A <= As[0]:
+        return Nus[0]
+    # interpolate in log(A) for smooth behavior
+    return float(np.interp(np.log10(A), np.log10(As), Nus))
+
+def Nu_fully_developed_rectangular_constq(H, B):
+    """
+    Fully-developed laminar Nusselt number for constant heat flux boundary condition.
+    Large aspect ratio -> parallel-plate limit Nu = 8.235.
+    For A >= 8 we return the plate value; for smaller A we interpolate canonical points.
+    """
+    A = H / B
+    if A >= 8.0:
+        return 8.235
+    # interpolation points (A, Nu_constq) - smooth trend to plates limit
+    As = np.array([1.0, 2.0, 4.0, 8.0])
+    Nus = np.array([3.615, 4.117, 5.108, 6.13])  # gradual rise; A>=8 -> 8.235 asymptote
+    # note: for extremely accurate values use tabulated data (Shah & London). This is robust.
+    return float(np.interp(np.log10(A), np.log10(As), Nus))
+
+# small safe function to compute hydraulic area / wet perimeter if needed
+def channel_geom_from_w_h(w, H):
+    A_cs = w * H
+    P_wet = 2.0 * (w + H)
+    D_h = 4.0 * A_cs / P_wet
+    return A_cs, P_wet, D_h
+
+
+def estimate_mdot_needed_for_full_absorption(P_in, W, w, h_channel, A_module):
+    """
+    Estimate mdot required so qpp_chf >= qpp_heater (approx).
+    Returns mdot_needed (kg/s) and the intermediate numbers for inspection.
+    """
+    # local saturation / vapor density at P_in
+    T_sat = T_sat_func(P_in)
+    rho_v = P_in / (R_v * T_sat) if (R_v>0 and T_sat>0) else 0.0
+    # geometry
+    A_cs = w * h_channel
+    # approximate Bo_crit (same as used in march)
+    D_h = hydraulic_diameter_from_wh(w, h_channel)
+    Eo = g * (rho_l - rho_v) * D_h**2 / sigma if sigma>0 else 1.0
+    Bo_crit = 0.12 * np.sqrt(rho_v / rho_l) * (1.0 + Eo**(-0.5)) if Eo>0 else 0.12
+    # required G
+    qpp_heater = W / A_module
+    if Bo_crit * h_fg <= 0:
+        return np.nan, {'Bo_crit':Bo_crit, 'qpp_heater':qpp_heater}
+    G_needed = qpp_heater / (Bo_crit * h_fg)
+    mdot_needed = G_needed * A_cs
+    info = {'T_sat':T_sat, 'rho_v':rho_v, 'D_h':D_h, 'Eo':Eo,
+            'Bo_crit':Bo_crit, 'qpp_heater':qpp_heater, 'G_needed':G_needed}
+    return mdot_needed, info
+
+DEBUG = True 
+
+def march(mdot, P_in, w, A_module, h_channel, L, W, N=200):
+    """
+    Robust march() with consistent variable initialization and safe debug printing.
+    Returns x, T_b, P, alpha, Q_total_absorbed
+    """
+    # geometry
+    A_cs, P_wet, D_h = channel_geom_from_w_h(w, h_channel)
+    dx = L / N
+    x = np.linspace(0.0, L, N+1)
+    T_b = np.zeros(N+1)
+    P = np.zeros(N+1)
+    alpha = np.zeros(N+1)
+    qpp_arr = np.zeros(N)
+
+    # initial conditions
+    T_b[0] = T_in
+    P[0] = P_in
+    alpha[0] = 0.0
+
+    # heater supply (flux)
+    if A_module <= 0:
+        raise ValueError("A_module must be > 0")
+    qpp_heater_global = W / A_module   # W/m^2 (supply)
+
+    for i in range(N):
+        curr_P = P[i]
+        curr_T = T_b[i]
+        curr_alpha = alpha[i]
+
+        # local saturation and mixture props (use saturation T for local P)
+        T_sat_curr = T_sat_func(curr_P)
+        rho_v_curr = curr_P / (R_v * T_sat_curr) if (R_v>0 and T_sat_curr>0) else 0.0
+        rho_m = (1.0 - curr_alpha) * rho_l + curr_alpha * rho_v_curr
+        mu_m = (1.0 - curr_alpha) * mu_l + curr_alpha * mu_v
+        if rho_m == 0 or mu_m == 0:
+            rho_m = rho_l
+            mu_m = mu_l
+
+        # flow, Re, friction
+        u_m = mdot / (rho_m * A_cs) if (rho_m * A_cs) > 0 else 0.0
+        Re_m = rho_m * u_m * D_h / mu_m if mu_m > 0 else 0.0
+        f_rect = f_straight_darcy_rectangular(Re_m, h_channel, w, n_terms=201)
+        f = f_rect if not np.isnan(f_rect) else (64.0 / Re_m if Re_m>1e-12 else 0.0)
+        delta = D_h / (2.0 * R_c) if R_c > 0 else 0.0
+        De = Re_m * np.sqrt(delta) if delta > 0 else 0.0
+        dP_dx = -f * rho_m * u_m**2 / (2.0 * D_h)
+
+        # --- compute CHF baseline variables (we keep qpp_chf defined for debug/inspection) ---
+        G = mdot / A_cs if A_cs>0 else 1.0
+        Eo = g * (rho_l - rho_v_curr) * D_h**2 / sigma if sigma>0 else 1.0
+        Bo_crit = 0.12 * np.sqrt(rho_v_curr / rho_l) * (1.0 + Eo**(-0.5)) if Eo>0 else 0.12
+        qpp_chf = Bo_crit * G * h_fg if (G>0 and h_fg>0) else 0.0
+
+        # Prepare defaults so debug print never references undefined names
+        E_in = 0.0
+        E_needed_to_sat = mdot * cp_l * max(0.0, (T_sat_curr - curr_T))  # [W] for whole flow
+        qpp_used = 0.0
+        dalpha_dx = 0.0
+        T_next = curr_T
+        phase = 'unknown'
+
+        # convective & heater
+        Nu_l = Nu_fully_developed_rectangular_constq(h_channel, w)
+        h_l_curr = max(1e-12, Nu_l * k_l / D_h)
+        qpp_convective = h_l_curr * max(0.0, (T_w - curr_T))   # sensible convective flux cap
+        qpp_heater = qpp_heater_global
+
+        # sensible heating available
+        qpp_sensible = min(qpp_heater, qpp_convective)
+        E_sensible = qpp_sensible * P_wet * dx   # [W] available for sensible heating in this slice
+
+        # Branches
+        if curr_T < T_sat_curr:
+            # single-phase sensible heating (may reach saturation)
+            if E_sensible < E_needed_to_sat:
+                # only sensible heating
+                DeltaT = E_sensible / (mdot * cp_l) if (mdot>0 and cp_l>0) else 0.0
+                T_next = curr_T + DeltaT
+                qpp_used = qpp_sensible
+                phase = 'single'
+                E_in = E_sensible
+            else:
+                # reach saturation inside this slice: sensible part used fully
+                E_remain_total = E_sensible - E_needed_to_sat
+                # compute CHF-limited latent flux (local)
+                Eo_loc = g * (rho_l - rho_v_curr) * D_h**2 / sigma if sigma>0 else 1.0
+                Bo_crit_loc = 0.12 * np.sqrt(rho_v_curr / rho_l) * (1.0 + Eo_loc**(-0.5)) if Eo_loc>0 else 0.12
+                qpp_chf_loc = Bo_crit_loc * (mdot / A_cs) * h_fg if (A_cs>0 and h_fg>0) else 0.0
+                qpp_latent = min(qpp_heater, qpp_chf_loc)
+                E_latent_available = qpp_latent * P_wet * dx
+                E_latent_used = min(E_remain_total, E_latent_available)
+                # compute dalpha for the slice
+                dalpha = E_latent_used / (mdot * h_fg) if (mdot>0 and h_fg>0) else 0.0
+                dalpha_dx = dalpha / dx if dx>0 else 0.0
+                T_next = T_sat_curr
+                phase = 'boiling'
+                qpp_used = (E_sensible + E_latent_used) / (P_wet * dx)
+                E_in = E_sensible + E_latent_used
+
+        elif curr_alpha < 1.0:
+            # boiling region: latent limited by CHF
+            Eo_loc = g * (rho_l - rho_v_curr) * D_h**2 / sigma if sigma>0 else 1.0
+            Bo_crit_loc = 0.12 * np.sqrt(rho_v_curr / rho_l) * (1.0 + Eo_loc**(-0.5)) if Eo_loc>0 else 0.12
+            qpp_chf_loc = Bo_crit_loc * (mdot / A_cs) * h_fg if (A_cs>0 and h_fg>0) else 0.0
+            qpp_latent = min(qpp_heater, qpp_chf_loc)
+            E_latent = qpp_latent * P_wet * dx
+            dalpha = E_latent / (mdot * h_fg) if (mdot>0 and h_fg>0) else 0.0
+            dalpha_dx = dalpha / dx if dx>0 else 0.0
+            T_next = T_sat_curr
+            phase = 'boiling'
+            qpp_used = qpp_latent
+            E_in = E_latent
+
+        else:
+            # all vapor (superheated)
+            Nu_v = Nu_fully_developed_rectangular_constq(h_channel, w)
+            h_v_curr = max(1e-12, Nu_v * k_v / D_h)
+            qpp_v = min(qpp_heater, h_v_curr * max(0.0, (T_w - curr_T)))
+            E_v = qpp_v * P_wet * dx
+            DeltaT = E_v / (mdot * cp_v) if (mdot>0 and cp_v>0) else 0.0
+            T_next = curr_T + DeltaT
+            phase = 'super'
+            qpp_used = qpp_v
+            E_in = E_v
+
+        # Guard: prevent alpha from exceeding 1 during the update
+        delta_alpha = dalpha_dx * dx if dalpha_dx is not None else 0.0
+        if curr_alpha + delta_alpha > 1.0:
+            allowable = max(0.0, 1.0 - curr_alpha)
+            if allowable > 0 and (mdot>0 and h_fg>0):
+                E_latent_allowed = allowable * mdot * h_fg
+                E_sensible_used = min(E_sensible, E_needed_to_sat) if 'E_sensible' in locals() else 0.0
+                total_E_used = E_sensible_used + E_latent_allowed
+                qpp_used = total_E_used / (P_wet * dx)
+                dalpha_dx = allowable / dx if dx>0 else 0.0
+                E_in = total_E_used
+            else:
+                dalpha_dx = 0.0
+
+        # store qpp actually used (after sensible+latent and CHF for latent)
+        qpp_arr[i] = float(qpp_used)
+
+        # update alpha and temperature and pressure
+        alpha[i+1] = min(1.0, max(0.0, curr_alpha + (dalpha_dx * dx if dalpha_dx is not None else 0.0)))
+        T_b[i+1] = min(T_w, T_next)
+        P[i+1] = max(1e3, curr_P + dP_dx * dx)
+
+        # debug printing (safe: E_in and E_needed_to_sat are always defined)
+        if DEBUG and (i % max(1, N//20) == 0):
+            print(f"[i={i}] x={x[i]:.6f} m, Re={Re_m:.3g}, De={De:.3g}, qpp_used={qpp_used:.3g} W/m2, qpp_chf={qpp_chf:.3g},")
+            print(f"         E_in={E_in:.3e} W, E_need={E_needed_to_sat:.3e} W, phase={phase}, T={curr_T:.2f}->{T_b[i+1]:.2f}, alpha={alpha[i+1]:.3f}")
+
+    # total absorbed heat (use actual qpp_arr)
+    a_per_length = A_module / L   # m^2 of heated surface per m axial
+    Q_total = a_per_length * np.trapezoid(qpp_arr, x[:-1])  # W
+    return x, T_b, P, alpha, Q_total
+
+def find_mdot_with_check(P_in, W, w, A_module, h_channel, L,
+                         mdot_min=1e-12, mdot_max=1e-3, n_samples=80):
+    """
+    Wrapper around find_mdot: first checks whether any mdot can physically absorb W.
+    If physically impossible (max Q < W within search range), it returns the mdot that
+    gives the maximum Q and prints diagnostics.
+    """
+    # quick estimate
+    mdot_est, info = estimate_mdot_needed_for_full_absorption(P_in, W, w, h_channel, A_module)
+    print(f"Estimate mdot required to avoid CHF-limiting <--> mdot_needed = {mdot_est:.3e} kg/s")
+    print("Intermediate info:", info)
+
+    # sample Q(mdot)
+    mdot_candidates = np.logspace(np.log10(mdot_min), np.log10(mdot_max), n_samples)
+    Qs = np.full_like(mdot_candidates, np.nan, dtype=float)
+
+    for i, m in enumerate(mdot_candidates):
+        try:
+            _,_,_,_,Q = march(m, P_in, w, A_module, h_channel, L, W, N=200)
+            Qs[i] = Q
+        except Exception as e:
+            # mark as nan and print short diagnostic
+            Qs[i] = np.nan
+            if DEBUG:
+                print(f" march failed at mdot={m:.3e}: {e}")
+
+    # check if any successful samples
+    if np.all(np.isnan(Qs)):
+        raise RuntimeError("All march() attempts failed in find_mdot_with_check sampling. Check march() implementation.")
+
+    Qmax = np.nanmax(Qs)
+    idx_max = int(np.nanargmax(Qs))
+    m_at_Qmax = mdot_candidates[idx_max]
+    print(f"Maximum Q achievable in sampled range = {Qmax:.4g} W at mdot = {m_at_Qmax:.3e} kg/s")
+
+    if Qmax < W * 0.999:   # allow small numerical slack
+        print("WARNING: heater power cannot be fully absorbed by fluid in sampled mdot range.")
+        print("Returning mdot that maximizes Q (you may need to increase mdot, increase area, or reduce W).")
+        return m_at_Qmax, {'Qmax':Qmax, 'mdot_best':m_at_Qmax}
+
+    # otherwise find bracket where Q(m)-W crosses zero
+    for k in range(len(mdot_candidates)-1):
+        f1 = Qs[k] - W
+        f2 = Qs[k+1] - W
+        if np.isnan(f1) or np.isnan(f2):
+            continue
+        if f1 == 0.0:
+            return mdot_candidates[k], {'Q':Qs[k]}
+        if f1 * f2 < 0:
+            a = mdot_candidates[k]; b = mdot_candidates[k+1]
+            sol = brentq(lambda m: march(m, P_in, w, A_module, h_channel, L, W)[4] - W, a, b)
+            return sol, {'Q':W}
+
+    # fallback (shouldn't normally happen because Qmax >= W)
+    return m_at_Qmax, {'Qmax':Qmax, 'mdot_best':m_at_Qmax}
+
+# Cases with longer L
+# cases = []
+# As = [5.4e-6, 5.16e-6]  # m^2
+# Ls = [6.37e-3, 6.087e-3] # m
+# P_ins = [1e5, 5e5, 1e6]
+# Ws = [1, 5, 10]
+# example_case = None
+# for A_module in As:
+#     for L in Ls:
+#         for P_in in P_ins:
+#             for W in Ws:
+#                 mdot, info = find_mdot_with_check(P_in, W, w, A_module, h_channel, L, mdot_min=1e-12, mdot_max=1e-3, n_samples=120)
+#                 x, T, P_arr, alpha, _ = march(mdot, P_in, w, A_module, h_channel, L, W)
+#                 idx_vap = np.where(alpha >= 0.9)[0]
+#                 x_vap = x[idx_vap[0]] if len(idx_vap) > 0 else L
+#                 P_exit = P_arr[-1] / 1e5
+#                 T_exit = T[-1]
+#                 cases.append({
+#                     'A (um^2)': round(A_module * 1e6),
+#                     'L (mm)': round(L * 1000),
+#                     'P_in (bar)': round(P_in / 1e5, 1),
+#                     'W (W)': W,
+#                     'mdot (ug/s)': round(mdot * 1e6, 2),
+#                     'x_vap (mm)': round(x_vap * 1000, 1),
+#                     'T_exit (K)': round(T_exit, 1),
+#                     'P_exit (bar)': round(P_exit, 3),
+#                     'alpha_exit': round(alpha[-1], 2)
+#                 })
+#                 if example_case is None:
+#                     example_case = {'x': x[::20], 'T': T[::20], 'P': P_arr[::20] / 1e5, 'alpha': alpha[::20]}
+
+
+
+# df = pd.DataFrame(cases)
+# print("Summary Table:")
+# print(df.to_string(index=False))
+
+A_module = 5.4e-6
+L = 6.37e-3
+P_in = 1e5
+W = 5.0
+mdot, info = find_mdot_with_check(P_in, W, w, A_module, h_channel, L, mdot_min=1e-12, mdot_max=1e-4, n_samples=120)
+x,T,P,alpha,Q = march(mdot, P_in, w, A_module, h_channel, L, W, N=200)
+print("mdot found (kg/s) = ", mdot, " Q_absorbed = ", Q)
+
+
+#print("\nExample Distributions for first case:")
+#for i in range(len(example_case['x'])):
+#    print(f"x={example_case['x'][i]:.5f}, T={example_case['T'][i]:.1f}, P={example_case['P'][i]:.3f}, alpha={example_case['alpha'][i]:.3f}")
