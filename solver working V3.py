@@ -92,34 +92,6 @@ def channel_geom_from_radii(r_in, r_out):
     return A_cs, P_wet, D_h
 
 # -------------------------
-# Fallback Nu (if shah table missing)
-# -------------------------
-def Nu_annulus_constq_fallback(r_star, sector_angle=None):
-    """
-    Placeholder approximate values for Nu(constant q) vs r* = r_in/r_out.
-    This is only used if shah_london_table.get_Nu is not available.
-    """
-    NU_TABLE = {
-        0.00: 4.36,    # approximate circular-tube-like baseline for r*=0
-        0.10: 4.50,
-        0.20: 4.70,
-        0.333333: 5.10,
-        0.50: 5.50,
-        0.75: 6.50,
-        0.90: 7.50,
-        0.99: 8.20
-    }
-    etas = np.array(sorted(NU_TABLE.keys()))
-    nus = np.array([NU_TABLE[e] for e in etas])
-    rstar = float(r_star)
-    if rstar <= etas[0]:
-        return float(nus[0])
-    if rstar >= etas[-1]:
-        return float(nus[-1])
-    return float(np.interp(rstar, etas, nus))
-
-
-# -------------------------
 # Heaters by voltage
 # -------------------------
 def heater_power_from_voltage(V, heater_id=1, both=False):
@@ -136,7 +108,7 @@ def heater_power_from_voltage(V, heater_id=1, both=False):
 # Core march() for multiple channels
 # -------------------------
 def march_annulus_multichannel(mdot_total, P_in, r_in, r_out, A_module, W_total,
-                               L=L_fixed, n_channels=5, sector_angle=None,
+                               L=L_fixed, n_channels=5,
                                t_sin=t_sin_default, k_sin=k_sin_default,
                                k_si=k_si_default, N=200):
     """
@@ -146,7 +118,6 @@ def march_annulus_multichannel(mdot_total, P_in, r_in, r_out, A_module, W_total,
     W_total: total heater electrical power (W) - applied to entire heater footprint
     L: channel length (m) fixed to 8.96 mm (user-specified)
     n_channels: number of channels in parallel (e.g. 5)
-    sector_angle: placeholder for Shah&London (pass None for now)
     Returns x, T_b, P, alpha, Q_total_absorbed
     """
 
@@ -372,7 +343,7 @@ def estimate_mdot_needed_annulus(P_in, W, r_in, r_out, A_module, n_channels=5):
     return mdot_needed, info
 
 def find_mdot_with_check_annulus(P_in, W, r_in, r_out, A_module,
-                                 n_channels=5, mdot_min=1e-12, mdot_max=1e-3, n_samples=80, sector_angle=None):
+                                 n_channels=5, mdot_min=1e-12, mdot_max=1e-3, n_samples=80):
     mdot_est, info = estimate_mdot_needed_annulus(P_in, W, r_in, r_out, A_module, n_channels=n_channels)
     print(f"Estimate mdot required to avoid CHF-limiting <--> mdot_needed = {mdot_est:.3e} kg/s")
     print("Intermediate info:", info)
@@ -382,7 +353,7 @@ def find_mdot_with_check_annulus(P_in, W, r_in, r_out, A_module,
 
     for i, m in enumerate(mdot_candidates):
         try:
-            _,_,_,_,Q = march_annulus_multichannel(m, P_in, r_in, r_out, A_module, W, L=L_fixed, n_channels=n_channels, sector_angle=sector_angle, N=200)
+            _,_,_,_,Q = march_annulus_multichannel(m, P_in, r_in, r_out, A_module, W, L=L_fixed, n_channels=n_channels, N=200)
             Qs[i] = Q
         except Exception as e:
             Qs[i] = np.nan
@@ -411,7 +382,7 @@ def find_mdot_with_check_annulus(P_in, W, r_in, r_out, A_module,
             return mdot_candidates[k], {'Q':Qs[k]}
         if f1 * f2 < 0:
             a = mdot_candidates[k]; b = mdot_candidates[k+1]
-            sol = brentq(lambda m: march_annulus_multichannel(m, P_in, r_in, r_out, A_module, W, L=L_fixed, n_channels=n_channels, sector_angle=sector_angle)[4] - W, a, b)
+            sol = brentq(lambda m: march_annulus_multichannel(m, P_in, r_in, r_out, A_module, W, L=L_fixed, n_channels=n_channels)[4] - W, a, b)
             return sol, {'Q':W}
 
     return m_at_Qmax, {'Qmax':Qmax, 'mdot_best':m_at_Qmax}
@@ -427,8 +398,6 @@ if __name__ == "__main__":
           " both=", heater_power_from_voltage(V_applied, both=True))
 
     results = []
-    # sector_angle placeholder (you will supply real values later). Kept None for now.
-    sector_angle_placeholder = 180
 
     for A_module, r_in, r_out in zip(As_list, r_in_list, r_out_list):
         # Use L_fixed (explicit)
@@ -437,10 +406,9 @@ if __name__ == "__main__":
 
         # find mdot that absorbs heater1 power
         mdot, info = find_mdot_with_check_annulus(1e5, W_heater1, r_in, r_out, A_module,
-                                                  n_channels=n_channels, mdot_min=1e-12, mdot_max=1e-3, n_samples=120,
-                                                  sector_angle=sector_angle_placeholder)
+                                                  n_channels=n_channels, mdot_min=1e-12, mdot_max=1e-3, n_samples=120)
         x, T, P_arr, alpha, Q = march_annulus_multichannel(mdot, 1e5, r_in, r_out, A_module, W_heater1,
-                                                           L=L_calc, n_channels=n_channels, sector_angle=sector_angle_placeholder, N=200)
+                                                           L=L_calc, n_channels=n_channels, N=200)
         results.append({'A':A_module, 'r_in':r_in, 'r_out':r_out, 'L':L_calc, 'mdot':mdot, 'Q':Q, 'alpha_exit':alpha[-1]})
         print(" mdot found (kg/s) = ", mdot, " Q_absorbed = ", Q)
 
