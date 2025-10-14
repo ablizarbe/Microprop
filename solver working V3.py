@@ -60,8 +60,12 @@ T_w = 473.0  # K
 
 # Si / SiN conductivities (defaults; you can override)
 k_si_default = 148.0    # W/mK (bulk Si at room temperature ~148)
-k_sin_default = 2.0     # W/mK (LPCVD SiN typical thin-film estimate; process-dependent)
+k_sin_default = 3.0     # W/mK (LPCVD SiN typical thin-film estimate; process-dependent)
 t_sin_default = 500e-9  # m (500 nm as corrected)
+
+# Add new constants for Thermal Boundary Resistance (TBR) per unit area.
+Rpp_tbr_mosin = 2.0e-8 # m^2*K/W (for the Molybdenum/SiN interface)
+Rpp_tbr_sinsi = 2.0e-8 # m^2*K/W (for the SiN/Silicon interface)
 
 # Physical properties (kept from your original file)
 g = 9.81
@@ -78,6 +82,22 @@ h_fg = 2.257e6
 R_c = 1e-3  # curvature radius
 
 DEBUG = False
+
+# -------------------------
+# Temperature-Dependent Conductivity
+# -------------------------
+def get_temp_dependent_k(T_k):
+    """
+    Calculates temperature-dependent thermal conductivities for materials.
+    T_k: Temperature in Kelvin
+    """
+    # Formula for Silicon (Si)
+    k_si = 134122.4940 * (T_k ** -1.2073)
+    
+    # Formula for Molybdenum (Mo)
+    k_mo = 152.78 - 5.0884e-2 * T_k + 9.675e-6 * (T_k ** 2)
+    
+    return k_si
 
 # -------------------------
 # Geometry helpers (annulus)
@@ -109,8 +129,7 @@ def heater_power_from_voltage(V, heater_id=1, both=False):
 # -------------------------
 def march_annulus_multichannel(mdot_total, P_in, r_in, r_out, A_module, W_total,
                                L=L_fixed, n_channels=5,
-                               t_sin=t_sin_default, k_sin=k_sin_default,
-                               k_si=k_si_default, N=200):
+                               t_sin=t_sin_default, k_sin=k_sin_default, N=200):
     """
     mdot_total: total mass flow across all channels (kg/s)
     r_in, r_out: radii of each annular channel (m)
@@ -156,7 +175,6 @@ def march_annulus_multichannel(mdot_total, P_in, r_in, r_out, A_module, W_total,
 
     # Resistances per unit heater area (m^2 K / W)
     Rpp_sin = t_sin / k_sin
-    Rpp_si = t_si / k_si
 
     # Total wetted perimeter for all channels (m per channel * n_channels)
     P_wet_total = P_wet_channel * n_channels
@@ -169,6 +187,10 @@ def march_annulus_multichannel(mdot_total, P_in, r_in, r_out, A_module, W_total,
         curr_P = P[i]
         curr_T = T_b[i]
         curr_alpha = alpha[i]
+
+        # Update to use temperature-dependent k_si
+        k_si_local = get_temp_dependent_k(curr_T)
+        Rpp_si = t_si / k_si_local
 
         # local saturation and mixture props
         T_sat_curr = PropsSI('T', 'P', curr_P, 'Q', 0, 'Water')
@@ -216,7 +238,7 @@ def march_annulus_multichannel(mdot_total, P_in, r_in, r_out, A_module, W_total,
         conv_cond_per_heater_area = h_l_curr * (P_wet_total / a_per_length)   # [W/(m2_heater K)]
 
         # series conduction resistance per heater area (SiN + Si + conv)
-        Rpp_total = Rpp_sin + Rpp_si + 1.0 / conv_cond_per_heater_area
+        Rpp_total = Rpp_tbr_mosin + Rpp_sin + Rpp_tbr_sinsi + Rpp_si + 1.0 / conv_cond_per_heater_area
 
         # possible conductive-limited heat flux per heater area
         qpp_possible_cond = (T_w - curr_T) / Rpp_total if Rpp_total > 0 else 0.0
@@ -287,7 +309,7 @@ def march_annulus_multichannel(mdot_total, P_in, r_in, r_out, A_module, W_total,
             conv_cond_v_per_heater_area = h_v_curr * (P_wet_total / a_per_length)
             qpp_v_heaterbasis = min(qpp_heater_global,
                                     conv_cond_v_per_heater_area * max(0.0, (T_w - curr_T)),
-                                    (T_w - curr_T) / (Rpp_sin + Rpp_si + 1.0 / conv_cond_v_per_heater_area))
+                                    (T_w - curr_T) / (Rpp_tbr_mosin + Rpp_sin + Rpp_tbr_sinsi + Rpp_si + 1.0 / conv_cond_v_per_heater_area))
             E_v = qpp_v_heaterbasis * a_per_length * dx
             DeltaT = E_v / (mdot_total * cp_v) if (mdot_total > 0 and cp_v > 0) else 0.0
             T_next = curr_T + DeltaT
