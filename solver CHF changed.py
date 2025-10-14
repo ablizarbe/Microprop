@@ -43,10 +43,8 @@ As_list = [5.4e-6, 5.16e-6]      # total heater area (m^2) - large, small (heate
 r_in_list = [54e-6, 20e-6]       # inner radius (m)
 r_out_list = [266e-6, 60e-6]     # outer radius (m)
 
-# Fixed length (you specified): 8.96 mm
+# Fixed length
 L_fixed = 8.96e-3  # m
-
-
 
 # Number of parallel channels
 n_channels = 5
@@ -55,7 +53,7 @@ n_channels = 5
 R_heater_1 = 3.40
 R_heater_2 = 2.38
 
-# Heater wall temperature (kept for conduction model)
+# Heater wall temperature
 T_w = 473.0  # K
 
 # Si / SiN conductivities (defaults; you can override)
@@ -63,11 +61,11 @@ k_si_default = 148.0    # W/mK (bulk Si at room temperature ~148)
 k_sin_default = 3.0     # W/mK (LPCVD SiN typical thin-film estimate; process-dependent)
 t_sin_default = 500e-9  # m (500 nm as corrected)
 
-# Add new constants for Thermal Boundary Resistance (TBR) per unit area.
+# Add constants for Thermal Boundary Resistance (TBR) per unit area.
 Rpp_tbr_mosin = 2.0e-8 # m^2*K/W (for the Molybdenum/SiN interface)
 Rpp_tbr_sinsi = 2.0e-8 # m^2*K/W (for the SiN/Silicon interface)
 
-# Physical properties (kept from your original file)
+# Physical properties 
 g = 9.81
 sigma = 0.059
 R_v = 461.5
@@ -123,6 +121,50 @@ def heater_power_from_voltage(V, heater_id=1, both=False):
         return V**2 / R_heater_2
     else:
         raise ValueError("heater_id must be 1 or 2 (or set both=True)")
+
+# -------------------------
+# CHF Correlation
+# -------------------------
+def calculate_chf_qu_mudawar(G, L, D_h, h_fg, rho_f, rho_g, sigma):
+    """
+    Calculates the Critical Heat Flux (CHF) for saturated flow boiling in parallel
+    microchannels using the Qu & Mudawar (2004) correlation.
+
+    This correlation is based on heat flux per unit wetted area.
+
+    Args:
+        G (float): Mass flux (kg/m^2s)
+        L (float): Total heated length of the microchannel (m)
+        D_h (float): Hydraulic diameter of the microchannel (m)
+        h_fg (float): Latent heat of vaporization (J/kg)
+        rho_f (float): Saturated liquid density (kg/m^3)
+        rho_g (float): Saturated vapor density (kg/m^3)
+        sigma (float): Surface tension (N/m)
+
+    Returns:
+        float: CHF value per unit wetted area (W/m^2_wetted)
+    """
+    # Guard against division by zero or invalid inputs
+    if not all([G > 0, L > 0, D_h > 0, h_fg > 0, rho_f > 0, rho_g > 0, sigma > 0]):
+        return 0.0
+
+    # Calculate dimensionless numbers
+    weber_number = (G**2 * L) / (sigma * rho_f)
+    density_ratio = rho_g / rho_f
+    length_to_diameter_ratio = L / D_h
+
+    if weber_number <= 0 or density_ratio <= 0 or length_to_diameter_ratio <= 0:
+        return 0.0
+
+    # Qu & Mudawar (2004) correlation for boiling number
+    boiling_number = 33.43 * (density_ratio**-1.11) * \
+                     (weber_number**0.21) * \
+                     (length_to_diameter_ratio**-0.36)
+
+    # Calculate CHF per unit wetted area
+    q_chf_per_wetted = G * h_fg * boiling_number
+    
+    return q_chf_per_wetted
 
 # -------------------------
 # Core march() for multiple channels
@@ -194,9 +236,14 @@ def march_annulus_multichannel(mdot_total, P_in, r_in, r_out, A_module, W_total,
 
         # local saturation and mixture props
         T_sat_curr = PropsSI('T', 'P', curr_P, 'Q', 0, 'Water')
-        rho_v_curr = curr_P / (R_v * T_sat_curr) if (R_v > 0 and T_sat_curr > 0) else 0.0
-        rho_m = (1.0 - curr_alpha) * rho_l + curr_alpha * rho_v_curr
-        mu_m = (1.0 - curr_alpha) * mu_l + curr_alpha * mu_v
+        # Use CoolProp for all local saturated properties for consistency
+        rho_f_curr = PropsSI('D', 'P', curr_P, 'Q', 0, 'Water')
+        rho_g_curr = PropsSI('D', 'P', curr_P, 'Q', 1, 'Water')
+        h_fg_curr = PropsSI('H', 'P', curr_P, 'Q', 1, 'Water') - PropsSI('H', 'P', curr_P, 'Q', 0, 'Water')
+        sigma_curr = PropsSI('I', 'P', curr_P, 'Q', 0, 'Water') # Surface tension
+
+        rho_m = (1.0 - curr_alpha) * rho_f_curr + curr_alpha * rho_g_curr
+        mu_m = (1.0 - curr_alpha) * mu_l + curr_alpha * mu_v # Note: mu_l and mu_v are still constants, can be updated if desired
 
         if rho_m <= 0 or mu_m <= 0:
             rho_m = rho_l
@@ -214,16 +261,17 @@ def march_annulus_multichannel(mdot_total, P_in, r_in, r_out, A_module, W_total,
         f = ef * f_s
         dP_dx = -f * rho_m * u_m**2 / (2.0 * D_h)
 
-        # CHF baseline (use per-channel G when computing Bo_crit, but qpp_chf is per heater area)
+        # CHF Calculation using Qu & Mudawar (2004) correlation
         G_channel = mdot_channel / A_cs if A_cs > 0 else 0.0
-        Eo = g * (rho_l - rho_v_curr) * D_h**2 / sigma if sigma > 0 else 1.0
-        Bo_crit = 0.12 * np.sqrt(rho_v_curr / rho_l) * (1.0 + Eo**(-0.5)) if Eo > 0 else 0.12
-        # qpp_chf derived from per-channel G but expressed as per-heater-area limit:
-        # latent power per channel per unit axial length (W/m_axial) = Bo_crit * G_channel * h_fg * (A_heater_per_channel_per_length?)
-        # Simpler consistent approach: compute qpp_chf_per_wetted_area ~ Bo_crit * G_channel * h_fg,
-        # then convert to per-heater-area by multiplying by (P_wet_channel / a_per_length) ratio if needed.
-        # For consistency with previous code and your Bo_crit formulation, we compute qpp_chf as:
-        qpp_chf_per_wetted = Bo_crit * G_channel * h_fg   # W per m^2_wetted (approx)
+        qpp_chf_per_wetted = calculate_chf_qu_mudawar(
+            G=G_channel,
+            L=L,
+            D_h=D_h,
+            h_fg=h_fg_curr,
+            rho_f=rho_f_curr,
+            rho_g=rho_g_curr,
+            sigma=sigma_curr
+        )
         # Convert CHF limit to per-heater-area basis (W per m^2_heater)
         # total latent power available per axial length (W/m_axial) limited by qpp_chf_per_wetted * P_wet_total
         # convert to flux per heater area: (W/m_axial) / a_per_length = qpp_chf_per_wetted * (P_wet_total / a_per_length)
@@ -295,13 +343,14 @@ def march_annulus_multichannel(mdot_total, P_in, r_in, r_out, A_module, W_total,
         elif curr_alpha < 1.0:
             # boiling region: latent limited by CHF
             qpp_latent = min(qpp_heater_global, qpp_chf, qpp_possible_cond)
+
             if i % (N // 2) == 0: # Print this for a few slices to avoid clutter
                 print(f" Limiting Fluxes (W/m^2):")
                 print(f"  Heater Power : {qpp_heater_global:.3e}")
                 print(f"  Conduction   : {qpp_possible_cond:.3e}")
                 print(f"  CHF (New)    : {qpp_chf:.3e}")
                 print(f"  --> Active Limit: {qpp_latent:.3e}\n")
-
+            
             E_latent = qpp_latent * a_per_length * dx
             dalpha = E_latent / (mdot_total * h_fg) if (mdot_total > 0 and h_fg > 0) else 0.0
             dalpha_dx = dalpha / dx if dx > 0 else 0.0
