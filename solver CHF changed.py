@@ -79,7 +79,7 @@ cp_v = 2080.0
 h_fg = 2.257e6
 R_c = 1e-3  # curvature radius
 
-DEBUG = False
+DEBUG = True
 
 # -------------------------
 # Temperature-Dependent Conductivity
@@ -165,6 +165,62 @@ def calculate_chf_qu_mudawar(G, L, D_h, h_fg, rho_f, rho_g, sigma):
     q_chf_per_wetted = G * h_fg * boiling_number
     
     return q_chf_per_wetted
+
+# -------------------------
+# CHF Diagnostics Helper
+# -------------------------
+def debug_chf_diagnostics(i, mdot_channel, A_cs, D_h, T_sat_curr, curr_P, sigma_curr,
+                          qpp_chf_per_wetted, P_wet_total, a_per_length, qpp_chf,
+                          qpp_heater_global, qpp_possible_cond, qpp_convective_heater, qpp_sensible_heaterbasis):
+    """
+    Prints a diagnostic table for CHF calculation variables.
+    This is a helper function for debugging and should only be called if DEBUG is True.
+    """
+    if DEBUG:
+        # --- Calculations for diagnostics ---
+        G_channel = mdot_channel / A_cs if A_cs > 0 else float('nan')
+        
+        # CoolProp densities for comparison
+        rho_l_curr_diag = PropsSI('D', 'P', curr_P, 'Q', 0, 'Water')
+        rho_v_coolprop_diag = PropsSI('D', 'P', curr_P, 'Q', 1, 'Water')
+
+        # Ideal gas density for comparison
+        rho_v_ideal = curr_P / (R_v * T_sat_curr) if (R_v > 0 and T_sat_curr > 0) else float('nan')
+
+        # Dimensionless numbers
+        Eo = g * (rho_l_curr_diag - rho_v_coolprop_diag) * D_h**2 / sigma_curr if sigma_curr > 0 else float('nan')
+        Bo_crit = float('nan')
+        if Eo > 0 and rho_l_curr_diag > 0:
+            Bo_crit = 0.12 * np.sqrt(rho_v_coolprop_diag / rho_l_curr_diag) * (1.0 + Eo**(-0.5))
+        
+        # Conversion ratio
+        ratio = P_wet_total / a_per_length if a_per_length > 0 else float('nan')
+
+        # --- Print diagnostics table ---
+        print(f"\n--- CHF Diagnostics (slice i={i}) ---")
+        print(f"  mdot_channel (kg/s)      : {mdot_channel:.3e}")
+        print(f"  A_cs (m^2)               : {A_cs:.3e}")
+        print(f"  G_channel (kg/m^2*s)     : {G_channel:.3e}")
+        print(f"  D_h (m)                  : {D_h:.3e}")
+        print(f"  T_sat_curr (K)           : {T_sat_curr:.3e}")
+        print(f"  curr_P (Pa)              : {curr_P:.3e}")
+        print(f"  rho_l_curr (kg/m^3)      : {rho_l_curr_diag:.3e}")
+        print(f"  rho_v_coolprop (kg/m^3)  : {rho_v_coolprop_diag:.3e}")
+        print(f"  rho_v_ideal (kg/m^3)     : {rho_v_ideal:.3e}")
+        print(f"  Eo (dimensionless)       : {Eo:.3e}")
+        print(f"  Bo_crit (dimensionless)  : {Bo_crit:.3e}")
+        print(f"  qpp_chf_per_wetted (W/m^2): {qpp_chf_per_wetted:.3e}")
+        print(f"  P_wet_total (m)          : {P_wet_total:.3e}")
+        print(f"  a_per_length (m^2/m)     : {a_per_length:.3e}")
+        print(f"  ratio (P_wet/a_len) (1/m): {ratio:.3e}")
+        print(f"  qpp_chf final (W/m^2_h)  : {qpp_chf:.3e}")
+        print(f"  --- Comparative Fluxes ---")
+        print(f"  qpp_heater_global (W/m^2_h): {qpp_heater_global:.3e}")
+        print(f"  qpp_possible_cond (W/m^2_h): {qpp_possible_cond:.3e}")
+        print(f"  qpp_convective_heater(W/m^2_h): {qpp_convective_heater:.3e}")
+        print(f"  qpp_sensible_heaterbasis(W/m^2_h): {qpp_sensible_heaterbasis:.3e}")
+        print(f"------------------------------------")
+
 
 # -------------------------
 # Core march() for multiple channels
@@ -296,6 +352,23 @@ def march_annulus_multichannel(mdot_total, P_in, r_in, r_out, A_module, W_total,
 
         # sensible heat available (per heater area) limited by heater, convection, conduction
         qpp_sensible_heaterbasis = min(qpp_heater_global, qpp_convective_heater, qpp_possible_cond)
+
+        # --- DIAGNOSTICS CALL ---
+        # Call the helper function to print detailed CHF diagnostics if DEBUG is enabled.
+        # This is placed here because the diagnostic printout includes flux values that are
+        # calculated after the initial qpp_chf value.
+        debug_chf_diagnostics(
+            i=i, mdot_channel=mdot_channel, A_cs=A_cs, D_h=D_h, T_sat_curr=T_sat_curr, curr_P=curr_P,
+            sigma_curr=sigma_curr, qpp_chf_per_wetted=qpp_chf_per_wetted, P_wet_total=P_wet_total,
+            a_per_length=a_per_length, qpp_chf=qpp_chf, qpp_heater_global=qpp_heater_global,
+            qpp_possible_cond=qpp_possible_cond, qpp_convective_heater=qpp_convective_heater,
+            qpp_sensible_heaterbasis=qpp_sensible_heaterbasis
+        )
+
+        # Non-invasive sanity check for extremely large CHF values.
+        if DEBUG and qpp_chf > 1e9:
+            print(f"  [WARNING] Extremely high qpp_chf detected at slice {i}: {qpp_chf:.3e} W/m^2_heater")
+        # --- END DIAGNOSTICS ---
 
         # energy (power) available in this slice (W) from heater sensible portion:
         E_sensible = qpp_sensible_heaterbasis * a_per_length * dx   # W * (m) => W (since qpp [W/m2] * area [m2] -> W); same as before

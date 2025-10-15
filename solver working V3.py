@@ -81,7 +81,7 @@ cp_v = 2080.0
 h_fg = 2.257e6
 R_c = 1e-3  # curvature radius
 
-DEBUG = False
+DEBUG = True
 
 # -------------------------
 # Temperature-Dependent Conductivity
@@ -123,6 +123,63 @@ def heater_power_from_voltage(V, heater_id=1, both=False):
         return V**2 / R_heater_2
     else:
         raise ValueError("heater_id must be 1 or 2 (or set both=True)")
+
+# -------------------------
+# CHF Diagnostic Helper
+# -------------------------
+def debug_chf_diagnostics(
+    mdot_channel, A_cs, G_channel, D_h, T_sat_curr, curr_P,
+    rho_v_curr, Eo, Bo_crit, qpp_chf_per_wetted,
+    P_wet_total, a_per_length, qpp_chf,
+    qpp_heater_global, qpp_possible_cond=None,
+    qpp_convective_heater=None, qpp_sensible_heaterbasis=None,
+    R_v=461.5, DEBUG=False
+):
+    """
+    Prints a diagnostic table for CHF calculation variables if DEBUG is True.
+    This is a non-invasive helper function.
+    """
+    if DEBUG:
+        print("\n--- CHF DIAGNOSTICS ---")
+        
+        # CoolProp-based densities for comparison
+        try:
+            rho_l_coolprop = PropsSI('D', 'P', curr_P, 'Q', 0, 'Water')
+            rho_v_coolprop = PropsSI('D', 'P', curr_P, 'Q', 1, 'Water')
+        except Exception:
+            rho_l_coolprop = float('nan')
+            rho_v_coolprop = float('nan')
+            
+        # Ideal gas density for comparison
+        rho_v_ideal = curr_P / (R_v * T_sat_curr) if T_sat_curr > 0 else float('nan')
+
+        # Ratio for conversion
+        ratio = P_wet_total / a_per_length if a_per_length > 0 else float('nan')
+
+        print(f"  mdot_channel (kg/s)      : {mdot_channel:.3e}")
+        print(f"  A_cs (m²)                : {A_cs:.3e}")
+        print(f"  G_channel (kg/m²·s)      : {G_channel:.3e}")
+        print(f"  D_h (m)                  : {D_h:.3e}")
+        print(f"  T_sat_curr (K)           : {T_sat_curr:.3f}")
+        print(f"  curr_P (Pa)              : {curr_P:.3e}")
+        print(f"  rho_l_coolprop (kg/m³)   : {rho_l_coolprop:.3e}")
+        print(f"  rho_v_coolprop (kg/m³)   : {rho_v_coolprop:.3e}")
+        print(f"  rho_v_ideal (kg/m³)      : {rho_v_ideal:.3e} (model uses rho_v_curr={rho_v_curr:.3e})")
+        print(f"  Eo (dim-less)            : {Eo:.3e}")
+        print(f"  Bo_crit (dim-less)       : {Bo_crit:.3e}")
+        print(f"  qpp_chf_per_wetted (W/m²): {qpp_chf_per_wetted:.3e}")
+        print(f"  P_wet_total (m)          : {P_wet_total:.3e}")
+        print(f"  a_per_length (m²/m)      : {a_per_length:.3e}")
+        print(f"  Ratio (P_wet/a_len) (1/m): {ratio:.3e}")
+        print(f"  qpp_chf final (W/m²_h)   : {qpp_chf:.3e}")
+        print(f"  qpp_heater_global (W/m²_h): {qpp_heater_global:.3e}")
+        if qpp_possible_cond is not None:
+            print(f"  qpp_possible_cond (W/m²_h): {qpp_possible_cond:.3e}")
+        if qpp_convective_heater is not None:
+             print(f"  qpp_convective (W/m²_h)  : {qpp_convective_heater:.3e}")
+        if qpp_sensible_heaterbasis is not None:
+             print(f"  qpp_sensible (W/m²_h)    : {qpp_sensible_heaterbasis:.3e}")
+        print("-------------------------\n")
 
 # -------------------------
 # Core march() for multiple channels
@@ -228,6 +285,18 @@ def march_annulus_multichannel(mdot_total, P_in, r_in, r_out, A_module, W_total,
         # total latent power available per axial length (W/m_axial) limited by qpp_chf_per_wetted * P_wet_total
         # convert to flux per heater area: (W/m_axial) / a_per_length = qpp_chf_per_wetted * (P_wet_total / a_per_length)
         qpp_chf = qpp_chf_per_wetted * (P_wet_total / a_per_length) if a_per_length > 0 else 0.0
+
+        # --- DIAGNOSTIC HOOK ---
+        # Call the helper function to print intermediate CHF variables if DEBUG is on.
+        debug_chf_diagnostics(
+            mdot_channel, A_cs, G_channel, D_h, T_sat_curr, curr_P,
+            rho_v_curr, Eo, Bo_crit, qpp_chf_per_wetted,
+            P_wet_total, a_per_length, qpp_chf, qpp_heater_global, DEBUG=DEBUG
+        )
+        # Non-invasive sanity check for extremely large CHF values.
+        if DEBUG and qpp_chf > 1e9:
+            print(f"WARNING: Extremely high qpp_chf calculated ({qpp_chf:.3e} W/m²_heater). Check inputs and formulas.")
+        # --- END DIAGNOSTIC HOOK ---
 
         # Nusselt number calculation for serpentine channels
         Nu_straight = 4.36  # Baseline for straight circular pipe with uniform heat flux
