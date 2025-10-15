@@ -39,9 +39,12 @@ class SerpentineCorrelation:
 # USER / MATERIAL SETTINGS
 # -------------------------
 # Two cases (large, small) as requested:
+# IMPORTANT: r_in_list and r_out_list naming kept for backward compat, but now interpreted as:
+#   r_in_list  -> t_wall_list (pipe wall thickness) [m]
+#   r_out_list -> D_o_list    (pipe outer diameter) [m]
 As_list = [5.4e-6, 5.16e-6]      # total heater area (m^2) - large, small (heater footprint)
-r_in_list = [54e-6, 20e-6]       # inner radius (m)
-r_out_list = [266e-6, 60e-6]     # outer radius (m)
+r_in_list = [54e-6, 20e-6]       # t_wall (m) per case
+r_out_list = [266e-6, 60e-6]     # D_o (m) per case
 
 # Fixed length (you specified): 8.96 mm
 L_fixed = 8.96e-3  # m
@@ -62,6 +65,18 @@ T_w = 473.0  # K
 k_si_default = 148.0    # W/mK (bulk Si at room temperature ~148)
 k_sin_default = 3.0     # W/mK (LPCVD SiN typical thin-film estimate; process-dependent)
 t_sin_default = 500e-9  # m (500 nm as corrected)
+"""
+IMPORTANT: Geometry vs conduction decoupling
+- r_in_list and r_out_list were previously used as inner/outer radii of an annulus,
+    and their difference was used as the silicon conduction thickness (t_si).
+- Per the latest clarification, these values represent standard pipe thicknesses
+    and should NOT be used to infer the silicon conduction thickness.
+
+To avoid propagating errors, we now decouple conduction thickness from geometry
+and expose an explicit t_si value. Update t_si_default below as appropriate for
+your stack (e.g., wafer/device thickness participating in conduction).
+"""
+t_si_default = 100e-6   # m (default silicon conduction thickness; update to your actual value)
 
 # Add new constants for Thermal Boundary Resistance (TBR) per unit area.
 Rpp_tbr_mosin = 2.0e-8 # m^2*K/W (for the Molybdenum/SiN interface)
@@ -81,7 +96,7 @@ cp_v = 2080.0
 h_fg = 2.257e6
 R_c = 1e-3  # curvature radius
 
-DEBUG = True
+DEBUG = False
 
 # -------------------------
 # Temperature-Dependent Conductivity
@@ -100,15 +115,33 @@ def get_temp_dependent_k(T_k):
     return k_si
 
 # -------------------------
-# Geometry helpers (annulus)
+# Geometry helper (circular pipe)
 # -------------------------
 def channel_geom_from_radii(r_in, r_out):
-    """Annular cross-section geometry (per single channel)."""
-    if r_out <= r_in:
-        raise ValueError("r_out must be > r_in")
-    A_cs = np.pi * (r_out**2 - r_in**2)           # cross-sectional area (m^2) per channel
-    P_wet = 2.0 * np.pi * (r_out + r_in)          # wetted perimeter (m) per channel (inner+outer)
-    D_h = 4.0 * A_cs / P_wet                      # hydraulic diameter per channel
+    """
+    Circular pipe geometry (per single channel), corrected:
+    Interprets inputs as:
+      - r_in  -> t_wall (pipe wall thickness) [m]
+      - r_out -> D_o    (pipe outer diameter) [m]
+
+    Computes inner diameter D_i = D_o - 2*t_wall and returns:
+      - A_cs  = π D_i^2 / 4
+      - P_wet = π D_i
+      - D_h   = D_i
+
+    Note: The previous implementation incorrectly treated r_in and r_out as
+    inner/outer radii of an annulus. This has been corrected per project specs.
+    """
+    t_wall = float(r_in)
+    D_o = float(r_out)
+    D_i = D_o - 2.0 * t_wall
+    if D_i <= 0:
+        raise ValueError(
+            f"Invalid pipe geometry: inner diameter <= 0 (D_i={D_i:.3e} m) given t_wall={t_wall:.3e} m and D_o={D_o:.3e} m"
+        )
+    A_cs = 0.25 * np.pi * D_i**2                 # cross-sectional area (m^2) per channel
+    P_wet = np.pi * D_i                          # wetted perimeter (m) per channel
+    D_h = D_i                                    # hydraulic diameter for circular pipe
     return A_cs, P_wet, D_h
 
 # -------------------------
@@ -186,10 +219,12 @@ def debug_chf_diagnostics(
 # -------------------------
 def march_annulus_multichannel(mdot_total, P_in, r_in, r_out, A_module, W_total,
                                L=L_fixed, n_channels=5,
-                               t_sin=t_sin_default, k_sin=k_sin_default, N=200):
+                               t_sin=t_sin_default, k_sin=k_sin_default,
+                               t_si=t_si_default,
+                               N=200):
     """
     mdot_total: total mass flow across all channels (kg/s)
-    r_in, r_out: radii of each annular channel (m)
+    r_in, r_out: interpreted as t_wall (m) and D_o (m) for standard circular pipes
     A_module: total heater footprint area (m^2) - for all channels combined
     W_total: total heater electrical power (W) - applied to entire heater footprint
     L: channel length (m) fixed to 8.96 mm (user-specified)
@@ -227,8 +262,9 @@ def march_annulus_multichannel(mdot_total, P_in, r_in, r_out, A_module, W_total,
     # Heater area per axial length (m^2_heater per m_axial)
     a_per_length = A_module / L
 
-    # Conduction thickness for Si (you explicitly wanted t_si = r_out - r_in)
-    t_si = max(1e-12, r_out - r_in)
+    # Conduction thickness for Si is now explicit and decoupled from flow geometry
+    # (do NOT derive from r_out - r_in which are pipe wall thicknesses, not silicon)
+    t_si = max(1e-12, t_si)
 
     # Resistances per unit heater area (m^2 K / W)
     Rpp_sin = t_sin / k_sin
@@ -364,7 +400,7 @@ def march_annulus_multichannel(mdot_total, P_in, r_in, r_out, A_module, W_total,
         elif curr_alpha < 1.0:
             # boiling region: latent limited by CHF
             qpp_latent = min(qpp_heater_global, qpp_chf, qpp_possible_cond)
-            if i % (N // 2) == 0: # Print this for a few slices to avoid clutter
+            if DEBUG and i % (N // 2) == 0: # Print this for a few slices to avoid clutter
                 print(f" Limiting Fluxes (W/m^2):")
                 print(f"  Heater Power : {qpp_heater_global:.3e}")
                 print(f"  Conduction   : {qpp_possible_cond:.3e}")
@@ -492,22 +528,41 @@ if __name__ == "__main__":
     # Example: apply voltage and heater 1
     V_applied = 7.0
     W_heater1 = heater_power_from_voltage(V_applied, heater_id=1)
-    print("Heater powers (W): heater1=", W_heater1, " heater2=", heater_power_from_voltage(V_applied, heater_id=2),
-          " both=", heater_power_from_voltage(V_applied, both=True))
+    print(
+        "Heater powers (W): heater1=", W_heater1,
+        " heater2=", heater_power_from_voltage(V_applied, heater_id=2),
+        " both=", heater_power_from_voltage(V_applied, both=True)
+    )
 
     results = []
 
     for A_module, r_in, r_out in zip(As_list, r_in_list, r_out_list):
         # Use L_fixed (explicit)
         L_calc = L_fixed
-        print(f"\nCase (A_module={A_module:.3e} m2, r_in={r_in:.3e} m, r_out={r_out:.3e} m) -> L = {L_calc*1e3:.3f} mm")
+        print(
+            f"\nCase (A_module={A_module:.3e} m2, t_wall={r_in:.3e} m, D_o={r_out:.3e} m) -> L = {L_calc*1e3:.3f} mm"
+        )
 
         # find mdot that absorbs heater1 power
-        mdot, info = find_mdot_with_check_annulus(1e5, W_heater1, r_in, r_out, A_module,
-                                                  n_channels=n_channels, mdot_min=1e-12, mdot_max=1e-3, n_samples=120)
-        x, T, P_arr, alpha, Q = march_annulus_multichannel(mdot, 1e5, r_in, r_out, A_module, W_heater1,
-                                                           L=L_calc, n_channels=n_channels, N=200)
-        results.append({'A':A_module, 'r_in':r_in, 'r_out':r_out, 'L':L_calc, 'mdot':mdot, 'Q':Q, 'alpha_exit':alpha[-1]})
+        mdot, info = find_mdot_with_check_annulus(
+            1e5, W_heater1, r_in, r_out, A_module,
+            n_channels=n_channels, mdot_min=1e-12, mdot_max=1e-3, n_samples=120
+        )
+        x, T, P_arr, alpha, Q = march_annulus_multichannel(
+            mdot, 1e5, r_in, r_out, A_module, W_heater1,
+            L=L_calc, n_channels=n_channels, N=200
+        )
+        results.append(
+            {
+                'A': A_module,
+                't_wall': r_in,
+                'D_o': r_out,
+                'L': L_calc,
+                'mdot': mdot,
+                'Q': Q,
+                'alpha_exit': alpha[-1],
+            }
+        )
         print(" mdot found (kg/s) = ", mdot, " Q_absorbed = ", Q)
 
     df = pd.DataFrame(results)
