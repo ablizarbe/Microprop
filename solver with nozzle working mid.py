@@ -93,9 +93,6 @@ nozzle_depth_default = 100e-6
 # Ambient/back pressure for thrust calculation (Pa)
 P_AMBIENT = 0
 
-# Default nozzle discharge coefficient (dimensionless). Can be adjusted per nozzle.
-NOZZLE_CD_DEFAULT = 0.9
-
 # -------------------------
 # Temperature-Dependent Conductivity
 # -------------------------
@@ -460,9 +457,9 @@ def march_annulus_multichannel(mdot_total, P_in, r_in, r_out, A_module, W_total,
     return x, T_b, P, alpha, Q_total
 
 # -------------------------
-# Estimate / search wrappers (renamed to reflect circular channels)
+# Estimate / search wrappers
 # -------------------------
-def estimate_mdot_needed_channel(P_in, W, r_in, r_out, A_module, n_channels=5):
+def estimate_mdot_needed_annulus(P_in, W, r_in, r_out, A_module, n_channels=5):
     T_sat = PropsSI('T','P',P_in,'Q',0,'Water')
     rho_v = P_in / (R_v * T_sat) if (R_v > 0 and T_sat > 0) else 0.0
     A_cs, P_wet_channel, D_h = channel_geom_from_radii(r_in, r_out)
@@ -477,9 +474,9 @@ def estimate_mdot_needed_channel(P_in, W, r_in, r_out, A_module, n_channels=5):
     info = {'T_sat':T_sat, 'rho_v':rho_v, 'D_h':D_h, 'Eo':Eo, 'Bo_crit':Bo_crit, 'qpp_heater':qpp_heater, 'G_needed':G_needed}
     return mdot_needed, info
 
-def find_mdot_with_check_channel(P_in, W, r_in, r_out, A_module,
+def find_mdot_with_check_annulus(P_in, W, r_in, r_out, A_module,
                                  n_channels=5, mdot_min=1e-12, mdot_max=1e-3, n_samples=80):
-    mdot_est, info = estimate_mdot_needed_channel(P_in, W, r_in, r_out, A_module, n_channels=n_channels)
+    mdot_est, info = estimate_mdot_needed_annulus(P_in, W, r_in, r_out, A_module, n_channels=n_channels)
     print(f"Estimate mdot required to avoid CHF-limiting <--> mdot_needed = {mdot_est:.3e} kg/s")
     print("Intermediate info:", info)
 
@@ -522,15 +519,6 @@ def find_mdot_with_check_channel(P_in, W, r_in, r_out, A_module,
 
     return m_at_Qmax, {'Qmax':Qmax, 'mdot_best':m_at_Qmax}
 
-# Backward-compatible wrappers (deprecated names)
-def estimate_mdot_needed_annulus(P_in, W, r_in, r_out, A_module, n_channels=5):
-    return estimate_mdot_needed_channel(P_in, W, r_in, r_out, A_module, n_channels)
-
-def find_mdot_with_check_annulus(P_in, W, r_in, r_out, A_module,
-                                 n_channels=5, mdot_min=1e-12, mdot_max=1e-3, n_samples=80):
-    return find_mdot_with_check_channel(P_in, W, r_in, r_out, A_module,
-                                        n_channels=n_channels, mdot_min=mdot_min, mdot_max=mdot_max, n_samples=n_samples)
-
 # -------------------------
 # Nozzle modeling utilities
 # -------------------------
@@ -550,18 +538,9 @@ def nozzle_geometry_areas(params, depth=nozzle_depth_default):
         um = 1e-6
         w_t = params['w_t'] * um
         w_nd = params['w_nd'] * um
-        l_nd = params.get('l_nd', 0.0) * um
         A_t = w_t * depth
         A_e = w_nd * depth
-        # Planar nozzle divergence half-angle approximation (flow discharge angle)
-        if l_nd > 0 and w_nd > w_t:
-            theta_e_rad = np.arctan((w_nd - w_t) / (2.0 * l_nd))
-        else:
-            theta_e_rad = 0.0
-        theta_e_deg = np.degrees(theta_e_rad)
-        # Per-nozzle discharge coefficient (optional in params)
-        Cd = params.get('Cd', NOZZLE_CD_DEFAULT)
-        return {'A_t': A_t, 'A_e': A_e, 'theta_e_rad': theta_e_rad, 'theta_e_deg': theta_e_deg, 'Cd': Cd}
+        return {'A_t': A_t, 'A_e': A_e}
 
 def _area_ratio_from_M(M, gamma):
     term = (1 + (gamma - 1) / 2 * M**2)
@@ -578,19 +557,7 @@ def _solve_M_from_area_ratio(Ae_At, gamma, supersonic=True):
     f = lambda M: _area_ratio_from_M(M, gamma) - Ae_At
     return brentq(f, a, b)
 
-def _mdot_choked_isentropic(P1, T1, A_t, gamma=1.33, R=R_v, Cd=NOZZLE_CD_DEFAULT):
-    """
-    Choked (sonic) mass flow at the throat for ideal gas isentropic model with discharge coefficient Cd.
-    """
-    if A_t <= 0 or P1 <= 0 or T1 <= 0:
-        return 0.0
-    base = (2.0 / (gamma + 1.0))**((gamma + 1.0) / (gamma - 1.0))
-    mdot_star = (A_t * P1 * gamma * np.sqrt(base)) / np.sqrt(gamma * R * T1)
-    return Cd * mdot_star
-
-def isentropic_nozzle_performance(P1, T1, A_t, A_e, gamma=1.33, R=R_v, p_ambient=P_AMBIENT,
-                                  mdot_override=None, Cd=NOZZLE_CD_DEFAULT,
-                                  theta_e_rad: float = 0.0):
+def isentropic_nozzle_performance(P1, T1, A_t, A_e, gamma=1.33, R=R_v, p_ambient=P_AMBIENT):
     """
     Compute nozzle exit performance using the user's equations (isentropic relations):
       - Thrust:        F = m_dot * Ve + (pe - pa) * Ae
@@ -603,8 +570,7 @@ def isentropic_nozzle_performance(P1, T1, A_t, A_e, gamma=1.33, R=R_v, p_ambient
     Returns dict with F, Isp, pe, Te, Ve, mdot, Me.
     """
     if A_t <= 0 or A_e <= 0:
-        return {'F':0.0,'Isp':0.0,'p_e':np.nan,'T_e':np.nan,'Ve':0.0,'mdot':0.0,'Me':np.nan,'mdot_choked':0.0,'choked':False,
-                'theta_e_deg': np.degrees(theta_e_rad), 'Cd': Cd}
+        return {'F':0.0,'Isp':0.0,'p_e':np.nan,'T_e':np.nan,'Ve':0.0,'mdot':0.0,'Me':np.nan}
 
     # Compute area ratio from geometry; depth cancels, so this equals width_exit/width_throat
     Ae_At = A_e / A_t
@@ -612,14 +578,8 @@ def isentropic_nozzle_performance(P1, T1, A_t, A_e, gamma=1.33, R=R_v, p_ambient
     # Solve for supersonic exit Mach number using area-M relation
     Me = _solve_M_from_area_ratio(Ae_At, gamma, supersonic=True)
 
-    # Choked mass flow with discharge coefficient
-    mdot_choked = _mdot_choked_isentropic(P1, T1, A_t, gamma=gamma, R=R, Cd=Cd)
-
-    # If override mass flow is provided (e.g., only vapor portion, or to avoid choking), use the lesser of override and choked
-    if mdot_override is None:
-        mdot = mdot_choked
-    else:
-        mdot = min(max(0.0, mdot_override), mdot_choked)
+    # User-provided mass flow relation (note: uses chamber total conditions)
+    mdot = (A_t * P1 * gamma * np.sqrt( (2.0 / (gamma + 1.0))**((gamma + 1.0) / (gamma - 1.0)) )) / np.sqrt(gamma * R * T1)
 
     # Exit velocity using user's formula (depends on T1)
     Ve = Me * np.sqrt(gamma * R * T1)
@@ -628,17 +588,13 @@ def isentropic_nozzle_performance(P1, T1, A_t, A_e, gamma=1.33, R=R_v, p_ambient
     Te = T1 * (1.0 + (gamma - 1.0) / 2.0 * Me**2)**-1.0
     pe = P1 * (1.0 + (gamma - 1.0) / 2.0 * Me**2)**(-gamma / (gamma - 1.0))
 
-    # Axial thrust reduction due to discharge angle (non-axial exhaust)
-    axial_factor = np.cos(theta_e_rad)
-    # Thrust including pressure term; only momentum term projected axially
-    F = mdot * Ve * axial_factor + (pe - p_ambient) * A_e
+    # Thrust including pressure term
+    F = mdot * Ve + (pe - p_ambient) * A_e
 
     g0 = 9.80665
     Isp = F / (mdot * g0) if mdot > 0 else 0.0
 
-    return {'F': F, 'Isp': Isp, 'p_e': pe, 'T_e': Te, 'Ve': Ve, 'mdot': mdot, 'Me': Me,
-        'mdot_choked': mdot_choked, 'choked': abs(mdot - mdot_choked) < 1e-12,
-        'theta_e_deg': np.degrees(theta_e_rad), 'Cd': Cd}
+    return {'F': F, 'Isp': Isp, 'p_e': pe, 'T_e': Te, 'Ve': Ve, 'mdot': mdot, 'Me': Me}
 
 def nozzle_params_catalog():
         """Return the three nozzle types provided by user, with dimensions in micrometers."""
@@ -647,145 +603,6 @@ def nozzle_params_catalog():
                 'W': {'w_nd':780, 'l_nd':660, 'w_nc':3000, 'l_nc':1500, 'w_t':45},
                 'B': {'w_nd':500, 'l_nd':500, 'w_nc':3000, 'l_nc':1600, 'w_t':45},
         }
-
-# -------------------------
-# mdot selection to avoid choking the nozzle (honor vapor fraction)
-# -------------------------
-def find_mdot_for_nozzle_nonchoked(P_in, W, r_in, r_out, A_module,
-                                   nozzle_params, depth=nozzle_depth_default,
-                                   n_channels=5, mdot_min=1e-12, mdot_max=1e-3,
-                                   n_samples=120, Cd=NOZZLE_CD_DEFAULT, gamma=1.33, R=R_v):
-    """
-    Find the smallest total mdot such that:
-      - The channel absorbs at least W (Q_total >= W), and
-      - The vapor mass reaching the nozzle (alpha_exit * mdot_total) does not exceed the choked capacity Cd * m*_choked(P1,T1,A_t),
-    where P1,T1,alpha_exit are the outlet conditions from the channel march.
-
-    Returns (mdot_total, info_dict) where info contains exit conditions and margins.
-    """
-    areas = nozzle_geometry_areas(nozzle_params, depth=depth)
-    A_t = areas['A_t']
-
-    # Sample candidate mdots, evaluate constraints
-    mdot_candidates = np.logspace(np.log10(max(mdot_min, 1e-14)), np.log10(mdot_max), n_samples)
-    valid = []
-    records = []
-
-    for m in mdot_candidates:
-        x, T_arr, P_arr, alpha_arr, Q = march_annulus_multichannel(
-            m, P_in, r_in, r_out, A_module, W, L=L_fixed, n_channels=n_channels, N=200
-        )
-        P1 = P_arr[-1]; T1 = T_arr[-1]; alpha_exit = alpha_arr[-1]
-        mdot_vapor = alpha_exit * m
-        mdot_choked = _mdot_choked_isentropic(P1, T1, A_t, gamma=gamma, R=R, Cd=Cd)
-        absorbs = (Q >= 0.999 * W)
-        nonchoked = (mdot_vapor <= mdot_choked)
-        records.append({'m':m, 'Q':Q, 'absorbs':absorbs, 'alpha_exit':alpha_exit,
-                        'P1':P1, 'T1':T1, 'mdot_vapor':mdot_vapor, 'mdot_choked':mdot_choked, 'nonchoked':nonchoked})
-        if absorbs and nonchoked:
-            valid.append(m)
-
-    if not valid:
-        # Try to pick the mdot that maximizes Q while non-choked; else pick the mdot that is closest to non-choked
-        nonchoked_records = [r for r in records if r['nonchoked']]
-        if nonchoked_records:
-            best = max(nonchoked_records, key=lambda r: r['Q'])
-            return best['m'], {'note':'Could not fully absorb W within non-choked regime; returning max Q non-choked.', **best}
-        # No non-choked points; return the mdot with highest Q and warn
-        best_any = max(records, key=lambda r: r['Q'])
-        return best_any['m'], {'note':'No non-choked points in sampled range; returning mdot with max Q (likely choked).', **best_any}
-
-    # Choose the smallest mdot that meets both constraints to maximize temperature rise per kg (and Isp)
-    m_valid_min = min(valid)
-
-    # Optional: refine via bisection between previous invalid and current valid to tighten mdot
-    idx = next(i for i, r in enumerate(records) if r['m'] == m_valid_min)
-    m_hi = m_valid_min
-    m_lo = records[idx-1]['m'] if idx > 0 else mdot_min
-    for _ in range(18):
-        m_mid = np.sqrt(m_lo * m_hi)
-        x, T_arr, P_arr, alpha_arr, Q = march_annulus_multichannel(
-            m_mid, P_in, r_in, r_out, A_module, W, L=L_fixed, n_channels=n_channels, N=200
-        )
-        P1 = P_arr[-1]; T1 = T_arr[-1]; alpha_exit = alpha_arr[-1]
-        mdot_vapor = alpha_exit * m_mid
-        mdot_choked = _mdot_choked_isentropic(P1, T1, A_t, gamma=gamma, R=R, Cd=Cd)
-        absorbs = (Q >= 0.999 * W)
-        nonchoked = (mdot_vapor <= mdot_choked)
-        if absorbs and nonchoked:
-            m_hi = m_mid
-            m_selected = m_mid
-            selected_info = {'m':m_mid,'Q':Q,'alpha_exit':alpha_exit,'P1':P1,'T1':T1,'mdot_vapor':mdot_vapor,'mdot_choked':mdot_choked,'absorbs':absorbs,'nonchoked':nonchoked}
-        else:
-            m_lo = m_mid
-    return m_selected, selected_info
-
-def find_mdot_for_nozzle_just_choked(P_in, W, r_in, r_out, A_module,
-                                     nozzle_params, depth=nozzle_depth_default,
-                                     n_channels=5, mdot_min=1e-12, mdot_max=1e-3,
-                                     n_samples=120, Cd=NOZZLE_CD_DEFAULT, gamma=1.33, R=R_v,
-                                     choke_tol=0.02):
-    """
-    Find the smallest total mdot such that:
-      - The channel absorbs at least W (Q_total >= W), and
-      - The vapor mass reaching the nozzle (alpha_exit * mdot_total) is at least the choked capacity (within tolerance),
-        i.e., alpha*mdot >= (1 - choke_tol) * Cd * m*_choked(P1,T1,A_t).
-
-    This targets the marginally-choked regime, which preserves the validity of the supersonic isentropic model and tends to maximize Isp
-    by minimizing mdot while achieving sonic throat conditions.
-    """
-    areas = nozzle_geometry_areas(nozzle_params, depth=depth)
-    A_t = areas['A_t']
-
-    mdot_candidates = np.logspace(np.log10(max(mdot_min, 1e-14)), np.log10(mdot_max), n_samples)
-    valid = []
-    records = []
-
-    for m in mdot_candidates:
-        x, T_arr, P_arr, alpha_arr, Q = march_annulus_multichannel(
-            m, P_in, r_in, r_out, A_module, W, L=L_fixed, n_channels=n_channels, N=200
-        )
-        P1 = P_arr[-1]; T1 = T_arr[-1]; alpha_exit = alpha_arr[-1]
-        mdot_vapor = alpha_exit * m
-        mdot_choked = _mdot_choked_isentropic(P1, T1, A_t, gamma=gamma, R=R, Cd=Cd)
-        absorbs = (Q >= 0.999 * W)
-        just_choked = (mdot_vapor >= (1.0 - choke_tol) * mdot_choked)
-        records.append({'m':m, 'Q':Q, 'absorbs':absorbs, 'alpha_exit':alpha_exit,
-                        'P1':P1, 'T1':T1, 'mdot_vapor':mdot_vapor, 'mdot_choked':mdot_choked, 'just_choked':just_choked})
-        if absorbs and just_choked:
-            valid.append(m)
-
-    if not valid:
-        # Fall back to non-choked best Q solution
-        nonchoked_records = [r for r in records if r['absorbs']]
-        if nonchoked_records:
-            best = min(nonchoked_records, key=lambda r: r['m'])
-            return best['m'], {'note':'Could not reach just-choked in sampled range; returning smallest mdot that absorbs W (likely unchoked).', **best}
-        best_any = max(records, key=lambda r: r['Q'])
-        return best_any['m'], {'note':'Could not absorb W in sampled range; returning mdot with max Q.', **best_any}
-
-    m_valid_min = min(valid)
-    idx = next(i for i, r in enumerate(records) if r['m'] == m_valid_min)
-    m_hi = m_valid_min
-    m_lo = records[idx-1]['m'] if idx > 0 else mdot_min
-    selected_info = None
-    for _ in range(18):
-        m_mid = np.sqrt(m_lo * m_hi)
-        x, T_arr, P_arr, alpha_arr, Q = march_annulus_multichannel(
-            m_mid, P_in, r_in, r_out, A_module, W, L=L_fixed, n_channels=n_channels, N=200
-        )
-        P1 = P_arr[-1]; T1 = T_arr[-1]; alpha_exit = alpha_arr[-1]
-        mdot_vapor = alpha_exit * m_mid
-        mdot_choked = _mdot_choked_isentropic(P1, T1, A_t, gamma=gamma, R=R, Cd=Cd)
-        absorbs = (Q >= 0.999 * W)
-        just_choked = (mdot_vapor >= (1.0 - choke_tol) * mdot_choked)
-        if absorbs and just_choked:
-            m_hi = m_mid
-            m_selected = m_mid
-            selected_info = {'m':m_mid,'Q':Q,'alpha_exit':alpha_exit,'P1':P1,'T1':T1,'mdot_vapor':mdot_vapor,'mdot_choked':mdot_choked,'absorbs':absorbs,'just_choked':just_choked}
-        else:
-            m_lo = m_mid
-    return m_selected, selected_info
 
 # -------------------------
 # Example run for both cases
@@ -807,32 +624,24 @@ if __name__ == "__main__":
     case_id = 1
     for A_module, r_in, r_out in zip(As_list, r_in_list, r_out_list):
         L_calc = L_fixed
+        # Flow solution with CHF bypass active
+        mdot, info = find_mdot_with_check_annulus(
+            1e5, W_heater1, r_in, r_out, A_module,
+            n_channels=n_channels, mdot_min=1e-12, mdot_max=1e-3, n_samples=120
+        )
+        x, T, P_arr, alpha, Q = march_annulus_multichannel(
+            mdot, 1e5, r_in, r_out, A_module, W_heater1,
+            L=L_calc, n_channels=n_channels, N=200
+        )
+
+        # Chamber conditions for nozzle model: use outlet conditions
+        P0 = P_arr[-1]
+        T0 = T[-1]
+
         for nozzle_name, params in nozzle_types.items():
-            # Find mdot that fully absorbs W while reaching a just-choked condition (best for Isp) with vapor-only flow
-            mdot, info = find_mdot_for_nozzle_just_choked(
-                1e5, W_heater1, r_in, r_out, A_module,
-                nozzle_params=params, depth=nozzle_depth_default,
-                n_channels=n_channels, mdot_min=1e-12, mdot_max=1e-3, n_samples=120,
-                Cd=params.get('Cd', NOZZLE_CD_DEFAULT), gamma=1.33, R=R_v
-            )
-
-            # March once at selected mdot to gather final fields
-            x, T, P_arr, alpha, Q = march_annulus_multichannel(
-                mdot, 1e5, r_in, r_out, A_module, W_heater1,
-                L=L_calc, n_channels=n_channels, N=200
-            )
-
-            # Chamber conditions for nozzle model: use outlet conditions
-            P0 = P_arr[-1]
-            T0 = T[-1]
-            areas = nozzle_geometry_areas(params, depth=nozzle_depth_default)
-
-            # Use only the vapor portion to drive the nozzle; cap with choked mdot via isentropic model with Cd
-            mdot_vapor = alpha[-1] * mdot
             areas = nozzle_geometry_areas(params, depth=nozzle_depth_default)
             perf = isentropic_nozzle_performance(
-                P1=P0, T1=T0, A_t=areas['A_t'], A_e=areas['A_e'], gamma=1.33, R=R_v, p_ambient=P_AMBIENT,
-                mdot_override=mdot_vapor, Cd=areas['Cd'], theta_e_rad=areas['theta_e_rad']
+                P1=P0, T1=T0, A_t=areas['A_t'], A_e=areas['A_e'], gamma=1.33, R=R_v, p_ambient=P_AMBIENT
             )
 
             # Metrics: P (W), mdot (mg/s), F (mN), Isp (s), p (bar), T (K), tau (mN/W)
@@ -844,9 +653,8 @@ if __name__ == "__main__":
             T_K = perf['T_e']
             tau_mN_per_W = F_mN / P_in_W if P_in_W > 0 else 0.0
 
-            print(f"Case {case_id}: A={A_module:.3e} m2, t_wall={r_in:.3e} m, D_o={r_out:.3e} m, Nozzle={nozzle_name} (Cd={areas['Cd']:.2f}, theta={areas['theta_e_deg']:.1f}°)")
-            print(f"  P={P_in_W:.3f} W, mdot_total={mdot*1e6:.3f} mg/s, alpha_exit={alpha[-1]:.3f}, mdot_noz={mdot_mgs:.3f} mg/s, choked={perf['choked']}")
-            print(f"  F={F_mN:.3f} mN, Isp={Isp_s:.2f} s, p={p_bar:.3f} bar, T={T_K:.2f} K, tau={tau_mN_per_W:.3f} mN/W")
+            print(f"Case {case_id}: A={A_module:.3e} m2, t_wall={r_in:.3e} m, D_o={r_out:.3e} m, Nozzle={nozzle_name}")
+            print(f"  P={P_in_W:.3f} W, mdot={mdot_mgs:.3f} mg/s, F={F_mN:.3f} mN, Isp={Isp_s:.2f} s, p={p_bar:.3f} bar, T={T_K:.2f} K, tau={tau_mN_per_W:.3f} mN/W")
 
             results.append({
                 'case': case_id,
@@ -855,8 +663,7 @@ if __name__ == "__main__":
                 'D_o': r_out,
                 'nozzle': nozzle_name,
                 'P_W': P_in_W,
-                'mdot_total_mgs': mdot*1e6,
-                'mdot_nozzle_mgs': mdot_mgs,
+                'mdot_mgs': mdot_mgs,
                 'F_mN': F_mN,
                 'Isp_s': Isp_s,
                 'p_bar': p_bar,
@@ -864,9 +671,6 @@ if __name__ == "__main__":
                 'tau_mN_per_W': tau_mN_per_W,
                 'Me': perf['Me'],
                 'alpha_exit': alpha[-1],
-                'choked': perf['choked'],
-                'theta_deg': perf['theta_e_deg'],
-                'Cd': perf['Cd'],
             })
             case_id += 1
 
