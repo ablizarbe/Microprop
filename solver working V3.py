@@ -4,37 +4,6 @@ import pandas as pd
 from scipy.interpolate import interp1d
 from CoolProp.CoolProp import PropsSI
 
-class SerpentineCorrelation:
-    def __init__(self, eNu_file='eNu_data.csv', ef_file='ef_data.csv'):
-        try:
-            # Load data using pandas
-            eNu_data = pd.read_csv(eNu_file)
-            ef_data = pd.read_csv(ef_file)
-
-            # Create interpolation functions
-            self.eNu_interp = interp1d(eNu_data['Reynolds'], eNu_data['eNu'], bounds_error=False, fill_value="extrapolate")
-            self.ef_interp = interp1d(ef_data['Reynolds'], ef_data['ef'], bounds_error=False, fill_value="extrapolate")
-
-            if DEBUG:
-                print("Successfully loaded and initialized serpentine correlations.")
-
-        except FileNotFoundError as e:
-            print(f"Error: Correlation file not found: {e}. Please ensure '{eNu_file}' and '{ef_file}' are in the same directory.")
-            # Fallback to default values if files are not found
-            self.eNu_interp = lambda x: 1.0
-            self.ef_interp = lambda x: 1.0
-        except Exception as e:
-            print(f"An error occurred during correlation initialization: {e}")
-            self.eNu_interp = lambda x: 1.0
-            self.ef_interp = lambda x: 1.0
-
-    def get_enhancement_factors(self, Re):
-        """
-        Returns the enhancement factors eNu and ef for a given Reynolds number.
-        """
-        return self.eNu_interp(Re), self.ef_interp(Re)
-
-
 # -------------------------
 # USER / MATERIAL SETTINGS
 # -------------------------
@@ -95,6 +64,38 @@ P_AMBIENT = 0
 
 # Default nozzle discharge coefficient (dimensionless). Can be adjusted per nozzle.
 NOZZLE_CD_DEFAULT = 0.9
+
+
+class SerpentineCorrelation:
+    def __init__(self, eNu_file='eNu_data.csv', ef_file='ef_data.csv'):
+        try:
+            # Load data using pandas
+            eNu_data = pd.read_csv(eNu_file)
+            ef_data = pd.read_csv(ef_file)
+
+            # Create interpolation functions
+            self.eNu_interp = interp1d(eNu_data['Reynolds'], eNu_data['eNu'], bounds_error=False, fill_value="extrapolate")
+            self.ef_interp = interp1d(ef_data['Reynolds'], ef_data['ef'], bounds_error=False, fill_value="extrapolate")
+
+            if DEBUG:
+                print("Successfully loaded and initialized serpentine correlations.")
+
+        except FileNotFoundError as e:
+            print(f"Error: Correlation file not found: {e}. Please ensure '{eNu_file}' and '{ef_file}' are in the same directory.")
+            # Fallback to default values if files are not found
+            self.eNu_interp = lambda x: 1.0
+            self.ef_interp = lambda x: 1.0
+        except Exception as e:
+            print(f"An error occurred during correlation initialization: {e}")
+            self.eNu_interp = lambda x: 1.0
+            self.ef_interp = lambda x: 1.0
+
+    def get_enhancement_factors(self, Re):
+        """
+        Returns the enhancement factors eNu and ef for a given Reynolds number.
+        """
+        return self.eNu_interp(Re), self.ef_interp(Re)
+
 
 # -------------------------
 # Temperature-Dependent Conductivity
@@ -283,26 +284,54 @@ def march_annulus_multichannel(mdot_total, P_in, r_in, r_out, A_module, W_total,
         k_si_local = get_temp_dependent_k(curr_T)
         Rpp_si = t_si / k_si_local
 
-        # local saturation and mixture props
+        # local saturation and mixture props (HEM with slip=1)
         T_sat_curr = PropsSI('T', 'P', curr_P, 'Q', 0, 'Water')
-        rho_v_curr = curr_P / (R_v * T_sat_curr) if (R_v > 0 and T_sat_curr > 0) else 0.0
-        rho_m = (1.0 - curr_alpha) * rho_l + curr_alpha * rho_v_curr
-        mu_m = (1.0 - curr_alpha) * mu_l + curr_alpha * mu_v
+        # Saturated densities from CoolProp with fallback
+        try:
+            rho_l_curr = PropsSI('D', 'P', curr_P, 'Q', 0, 'Water')
+            rho_v_curr = PropsSI('D', 'P', curr_P, 'Q', 1, 'Water')
+        except Exception:
+            rho_l_curr = rho_l
+            rho_v_curr = curr_P / (R_v * T_sat_curr) if (R_v > 0 and T_sat_curr > 0) else 1e-3
 
-        if rho_m <= 0 or mu_m <= 0:
-            rho_m = rho_l
-            mu_m = mu_l
+        # Interpret alpha as mass quality x (mass fraction of vapor)
+        x_mass = float(np.clip(curr_alpha, 0.0, 1.0))
+        denom = (x_mass / max(rho_v_curr, 1e-9)) + ((1.0 - x_mass) / max(rho_l_curr, 1e-9))
+        rho_m = 1.0 / max(denom, 1e-12)
+
+        # Void fraction for viscosity blending (HEM slip=1)
+        eps_void = (x_mass / max(rho_v_curr, 1e-9)) / max(denom, 1e-12)
+        eps_void = float(np.clip(eps_void, 0.0, 1.0))
+
+        # Mixture viscosity: geometric blend by void fraction (McAdams-type)
+        try:
+            mu_m = float(np.exp((1.0 - eps_void) * np.log(mu_l) + eps_void * np.log(mu_v)))
+        except Exception:
+            mu_m = (1.0 - eps_void) * mu_l + eps_void * mu_v
 
         # velocity and Re per channel (use per-channel area)
         u_m = mdot_channel / (rho_m * A_cs) if (rho_m * A_cs) > 0 else 0.0
         Re_m = rho_m * u_m * D_h / mu_m if mu_m > 0 else 0.0
 
-        # Get enhancement factors from the correlation helper
+        # Get enhancement factors from the correlation helper and clamp to sane ranges to avoid extrapolation blow-up
         eNu, ef = correlation_helper.get_enhancement_factors(Re_m)
+        try:
+            eNu = float(np.clip(eNu, 0.5, 12.0))
+            ef = float(np.clip(ef, 0.5, 8.0))
+        except Exception:
+            pass
 
-        # friction factor calculation for serpentine channels
-        f_s = 64.0 / Re_m if Re_m > 1e-12 else 1e12
-        f = ef * f_s
+        # Darcy friction factor with regime awareness (smooth pipe baseline)
+        if Re_m <= 0:
+            f_s = 1e3
+        elif Re_m < 2300.0:
+            f_s = 64.0 / Re_m
+        elif Re_m < 1.0e5:
+            f_s = 0.3164 / (Re_m ** 0.25)  # Blasius
+        else:
+            # Haaland (smooth pipe: roughness/D ~ 0)
+            f_s = (-1.8 * np.log10(6.9 / Re_m)) ** -2
+        f = max(1e-6, ef * f_s)
         dP_dx = -f * rho_m * u_m**2 / (2.0 * D_h)
 
         # CHF baseline (use per-channel G when computing Bo_crit, but qpp_chf is per heater area)
@@ -810,7 +839,7 @@ if __name__ == "__main__":
         for nozzle_name, params in nozzle_types.items():
             # Find mdot that fully absorbs W while reaching a just-choked condition (best for Isp) with vapor-only flow
             mdot, info = find_mdot_for_nozzle_just_choked(
-                1e5, W_heater1, r_in, r_out, A_module,
+                5e5, W_heater1, r_in, r_out, A_module,
                 nozzle_params=params, depth=nozzle_depth_default,
                 n_channels=n_channels, mdot_min=1e-12, mdot_max=1e-3, n_samples=120,
                 Cd=params.get('Cd', NOZZLE_CD_DEFAULT), gamma=1.33, R=R_v
@@ -818,7 +847,7 @@ if __name__ == "__main__":
 
             # March once at selected mdot to gather final fields
             x, T, P_arr, alpha, Q = march_annulus_multichannel(
-                mdot, 1e5, r_in, r_out, A_module, W_heater1,
+                mdot, 5e5, r_in, r_out, A_module, W_heater1,
                 L=L_calc, n_channels=n_channels, N=200
             )
 
@@ -867,6 +896,7 @@ if __name__ == "__main__":
                 'choked': perf['choked'],
                 'theta_deg': perf['theta_e_deg'],
                 'Cd': perf['Cd'],
+                'dP_chamber_Pa': float(P_arr[0] - P_arr[-1]),
             })
             case_id += 1
 
