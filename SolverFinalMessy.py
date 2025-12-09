@@ -36,6 +36,7 @@ REMOVE_SUPERHEAT_CAP = True  # Superheat bound disabled; fluid heating limited b
 FOULING_RPP = 1.0e-4           # Added fouling thermal resistance per unit heater area (m^2*K/W)
 MALDISTRIBUTION_FACTOR = 0.85  # Fraction of heat to fluid after maldistribution (<1 reduces efficiency)
 CONTACT_MIN = 0.60             # Min effective wall-fluid contact fraction due to bubble coverage
+ENTRANCE_EFFECTS_ENABLED = True  # Apply thermal entrance-length development factor on Nu
 FOULING_ENABLED = True           # Toggle fouling resistance
 MALDISTRIBUTION_ENABLED = True   # Toggle maldistribution scaling
 BOILING_CONTACT_ENABLED = True   # Toggle bubble coverage reduction in two-phase
@@ -50,10 +51,10 @@ RPP_BACK_CONTACT = 2.0e-4  # Contact/interface resistance to sink per unit area 
 SIGMA_SB = 5.670374419e-8 # Stefan-Boltzmann constant (W/m^2-K^4)
 
 # Geometry (Heater footprint and pipe dimensions)
-# Large and small heater footprints and associated channel dimensions (rectangular)
+# Large and small heater footprints and associated channel wall thickness & outer diameters
 HEATER_A_LIST = [5.4e-6, 5.16e-6]      # total heater area (m^2) - large, small
-CHANNEL_WIDTH_LIST = [212e-6, 40e-6]   # Channel width (m) per case
-CHANNEL_DEPTH = 100e-6                 # Channel depth (m) fixed
+WALL_THICKNESS_LIST = [54e-6, 20e-6]   # t_wall (m) per case
+OUTER_DIAM_LIST = [266e-6, 60e-6]      # D_o (m) per case
 L_fixed = 8.96e-3                     # Fixed channel length (m)
 
 # Nozzle depth (out-of-plane) in meters
@@ -67,7 +68,7 @@ R_heater_2 = 2.38
 k_si_default = 148.0    # W/mK (bulk Si)
 k_sin_default = 3.0     # W/mK (SiN thin film)
 t_sin_default = 500e-9  # m (SiN thickness)
-t_si_default = 200e-6   # m (Silicon conduction thickness) - FIXED to 200um
+t_si_default = 100e-6   # m (Silicon conduction thickness)
 
 # Thermal Boundary Resistances (interface per unit area)
 Rpp_tbr_mosin = 2.0e-8  # m^2*K/W (Mo/SiN)
@@ -95,7 +96,8 @@ NOZZLE_CD_DEFAULT = 0.9
 
 # Create legacy variable aliases (minimal downstream edits)
 As_list = HEATER_A_LIST
-width_list = CHANNEL_WIDTH_LIST
+r_in_list = WALL_THICKNESS_LIST
+r_out_list = OUTER_DIAM_LIST
 n_channels = N_CHANNELS
 T_w = HEATER_WALL_T
 nozzle_depth_default = NOZZLE_DEPTH_DEFAULT
@@ -182,27 +184,57 @@ class SerpentineCorrelation:
 # Dean-number-based Nusselt utility
 # -------------------------
 def compute_nusselt_dean(Re, Pr, D_h, R_c_eff, regime_hint=None):
-    """Laminar Dean-number-enhanced Nusselt number for curved microchannel.
+    """
+    Returns an effective Nusselt number for a curved (serpentine) circular channel
+    using a simple Dean-number enhancement applied to straight-pipe baselines.
 
-    All high-Re (turbulent/transitional) logic removed because Re never exceeds 2300
-    in the current application. We retain only a laminar baseline with conservative
-    curvature enhancement:
+    - Dean number: De = Re * sqrt(D_h / (2*R_c))
+    - Laminar baseline (constant heat flux): Nu0 = 4.36
+    - Turbulent baseline: Gnielinski correlation
+    - Curvature enhancement factors (conservative clamps to avoid blow-up):
+        laminar:   e_De = 1 + 0.10 * De^0.50   (clamped to [1, 3])
+        turbulent: e_De = 1 + 0.05 * De^0.20   (clamped to [1, 2])
 
-        De = Re * sqrt(D_h / (2*R_c))
-        Nu_lam (fully developed, const heat flux) = 4.36
-        e_De = 1 + 0.10 * De^0.50 (clamped to [1, 3])
-        Nu = Nu_lam * e_De (clamped >=3)
+    This is a pragmatic approximation for serpentine microchannels where Re is
+    typically low-to-moderate and curvature increases secondary-flow mixing.
     """
     Re = max(1e-9, float(Re))
     Pr = max(1e-6, float(Pr))
     D_h = max(1e-12, float(D_h))
     R_c_eff = max(1e-9, float(R_c_eff))
 
+    # Dean number
     De = Re * np.sqrt(D_h / (2.0 * R_c_eff))
-    Nu_lam = 4.36
-    e_De = 1.0 + 0.10 * (De ** 0.50)
-    e_De = float(np.clip(e_De, 1.0, 3.0))
-    Nu = Nu_lam * e_De
+
+    # Baselines
+    Nu_lam = 4.36  # fully developed, constant heat flux
+    # Turbulent baseline via Gnielinski (valid 3e3<Re<5e6, 0.5<Pr<200); we will guard outside
+    if Re < 3000:
+        # primarily laminar
+        e_De = 1.0 + 0.10 * (De ** 0.50)
+        e_De = float(np.clip(e_De, 1.0, 3.0))
+        Nu = Nu_lam * e_De
+    else:
+        # friction factor for smooth pipe (Petukhov) and Gnielinski Nu
+        f_pet = (0.79 * np.log(Re) - 1.64) ** -2
+        Nu_gn = (f_pet / 8.0 * (Re - 1000.0) * Pr) / (1.0 + 12.7 * np.sqrt(f_pet / 8.0) * (Pr ** (2.0 / 3.0) - 1.0))
+        Nu_gn = max(Nu_gn, 3.66)  # ensure not below laminar limit
+        e_De_t = 1.0 + 0.05 * (De ** 0.20)
+        e_De_t = float(np.clip(e_De_t, 1.0, 2.0))
+        Nu = Nu_gn * e_De_t
+
+    # Transitional smoothing (optional): if 2000<Re<3000, blend
+    if 2000.0 < Re < 3000.0:
+        # compute laminar and turbulent and blend
+        e_De_l = float(np.clip(1.0 + 0.10 * (De ** 0.50), 1.0, 3.0))
+        Nu_l = Nu_lam * e_De_l
+        f_pet = (0.79 * np.log(3000.0) - 1.64) ** -2
+        Nu_gn_ref = (f_pet / 8.0 * (3000.0 - 1000.0) * Pr) / (1.0 + 12.7 * np.sqrt(f_pet / 8.0) * (Pr ** (2.0 / 3.0) - 1.0))
+        e_De_t = float(np.clip(1.0 + 0.05 * (De ** 0.20), 1.0, 2.0))
+        Nu_t = max(Nu_gn_ref * e_De_t, 3.66)
+        w = (Re - 2000.0) / 1000.0
+        Nu = (1 - w) * Nu_l + w * Nu_t
+
     return float(max(Nu, 3.0))
 
 
@@ -223,43 +255,33 @@ def get_temp_dependent_k(T_k):
     return k_si
 
 # -------------------------
-# Geometry helper (rectangular channel)
+# Geometry helper (circular pipe)
 # -------------------------
-def channel_geom_rectangular(width, depth, debug=False):
+def channel_geom_from_radii(r_in, r_out):
     """
-    Rectangular channel geometry (per single channel).
-    Inputs:
-      - width  [m]
-      - depth  [m]
+    Circular pipe geometry (per single channel), corrected:
+    Interprets inputs as:
+      - r_in  -> t_wall (pipe wall thickness) [m]
+      - r_out -> D_o    (pipe outer diameter) [m]
 
-    Returns:
-      - A_cs  = width * depth
-      - P_wet = 2 * (width + depth)
-      - D_h   = 4 * A_cs / P_wet
+    Computes inner diameter D_i = D_o - 2*t_wall and returns:
+      - A_cs  = π D_i^2 / 4
+      - P_wet = π D_i
+      - D_h   = D_i
+
+    Note: The previous implementation incorrectly treated r_in and r_out as
+    inner/outer radii of an annulus. This has been corrected per project specs.
     """
-    w = float(width)
-    d = float(depth)
-    if w <= 0 or d <= 0:
+    t_wall = float(r_in)
+    D_o = float(r_out)
+    D_i = D_o - 2.0 * t_wall
+    if D_i <= 0:
         raise ValueError(
-            f"Invalid channel geometry: width={w:.3e} m, depth={d:.3e} m"
+            f"Invalid pipe geometry: inner diameter <= 0 (D_i={D_i:.3e} m) given t_wall={t_wall:.3e} m and D_o={D_o:.3e} m"
         )
-    A_cs = w * d                                 # cross-sectional area (m^2) per channel
-    P_wet = 2.0 * (w + d)                        # wetted perimeter (m) per channel
-    D_h = 4.0 * A_cs / P_wet                     # hydraulic diameter
-    
-    if debug:
-        print(f"\n  [DEBUG] channel_geom_rectangular():")
-        print(f"    Input: width = {w*1e6:.1f} µm, depth = {d*1e6:.1f} µm")
-        print(f"    RECTANGULAR cross-section calculations:")
-        print(f"      A_cs  = width × depth = {w*1e6:.1f} × {d*1e6:.1f} = {A_cs*1e12:.2f} µm²")
-        print(f"      P_wet = 2×(width + depth) = 2×({w*1e6:.1f} + {d*1e6:.1f}) = {P_wet*1e6:.1f} µm")
-        print(f"      D_h   = 4×A_cs/P_wet = 4×{A_cs*1e12:.2f}/{P_wet*1e6:.1f} = {D_h*1e6:.2f} µm")
-        # Verify this is NOT circular
-        if abs(w - d) < 1e-12:
-            print(f"      NOTE: Square channel (width ≈ depth)")
-        else:
-            print(f"      NOTE: Rectangular channel (aspect ratio = {max(w,d)/min(w,d):.2f})")
-    
+    A_cs = 0.25 * np.pi * D_i**2                 # cross-sectional area (m^2) per channel
+    P_wet = np.pi * D_i                          # wetted perimeter (m) per channel
+    D_h = D_i                                    # hydraulic diameter for circular pipe
     return A_cs, P_wet, D_h
 
 # -------------------------
@@ -282,18 +304,17 @@ def heater_power_from_voltage(V, heater_id=1, both=False):
 # -------------------------
 # Core march() for multiple channels
 # -------------------------
-def march_annulus_multichannel(mdot_total, P_in, width, depth, A_module, W_total,
+def march_annulus_multichannel(mdot_total, P_in, r_in, r_out, A_module, W_total,
                                L=L_fixed, n_channels=5,
                                t_sin=t_sin_default, k_sin=k_sin_default,
                                t_si=t_si_default,
                                T_in=T_INLET,
                                N=N_SLICES,
                                wall_cap_enabled: bool = WALL_CAP_ENABLED,
-                               max_superheat: float = MAX_SUPERHEAT,
-                               debug: bool = False):
+                               max_superheat: float = MAX_SUPERHEAT):
     """
     mdot_total: total mass flow across all channels (kg/s)
-    width, depth: channel dimensions (m)
+    r_in, r_out: interpreted as t_wall (m) and D_o (m) for standard circular pipes
     A_module: total heater footprint area (m^2) - for all channels combined
     W_total: total heater electrical power (W) - applied to entire heater footprint
     L: channel length (m) fixed to 8.96 mm (user-specified)
@@ -306,15 +327,7 @@ def march_annulus_multichannel(mdot_total, P_in, width, depth, A_module, W_total
         L = L_fixed
 
     # Per-channel geometry
-    A_cs, P_wet_channel, D_h = channel_geom_rectangular(width, depth, debug=debug)
-    
-    if debug:
-        print(f"  [DEBUG] march_annulus_multichannel() received:")
-        print(f"    Channel width  = {width*1e6:.1f} µm")
-        print(f"    Channel depth  = {depth*1e6:.1f} µm")
-        print(f"    n_channels     = {n_channels}")
-        print(f"    Per-channel: A_cs = {A_cs*1e12:.2f} µm², P_wet = {P_wet_channel*1e6:.1f} µm, D_h = {D_h*1e6:.2f} µm")
-        print(f"    Total for {n_channels} channels: A_cs_total = {A_cs*n_channels*1e12:.2f} µm², P_wet_total = {P_wet_channel*n_channels*1e6:.1f} µm")
+    A_cs, P_wet_channel, D_h = channel_geom_from_radii(r_in, r_out)
 
     # Split total mdot among channels
     mdot_channel = mdot_total / float(n_channels)
@@ -400,13 +413,18 @@ def march_annulus_multichannel(mdot_total, P_in, width, depth, A_module, W_total
         # Get enhancement factors from the correlation helper (already clamped inside)
         eNu, ef = correlation_helper.get_enhancement_factors(Re_m)
 
-        # Laminar friction factor only (Re < 2300 by design)
+        # Darcy friction factor with regime awareness (smooth pipe baseline)
         if Re_m <= 0:
             f_s = 1e3
+        elif Re_m < 2300.0:
+            f_s = 64.0 / Re_m
+        elif Re_m < 1.0e5:
+            f_s = 0.3164 / (Re_m ** 0.25)  # Blasius
         else:
-            f_s = 64.0 / Re_m  # Hagen–Poiseuille laminar relation
+            # Haaland (smooth pipe: roughness/D ~ 0)
+            f_s = (-1.8 * np.log10(6.9 / Re_m)) ** -2
         # Two-phase friction multiplier (bounded, modest increase around mid qualities)
-        tp_mult = 1.0 # + 10.0 * (x_loc * (1.0 - x_loc))  # REMOVED heuristic term
+        tp_mult = 1.0 + 10.0 * (x_loc * (1.0 - x_loc))  # in [1, 3.5]
         f = max(1e-6, ef * f_s * tp_mult)
         dP_dx_raw = -f * rho_phase * u_m**2 / (2.0 * D_h)
         # Clamp maximum fractional pressure loss per slice to avoid non-physical collapse in very low-density vapor
@@ -419,9 +437,17 @@ def march_annulus_multichannel(mdot_total, P_in, width, depth, A_module, W_total
 
         # Nusselt number using Dean-number enhanced model for serpentine curvature
         Nu_dean = compute_nusselt_dean(Re_m, Pr_phase, D_h, R_c_eff=R_c)
-        
+        # Apply thermal entrance-length development factor to reduce Nu if not fully developed
+        if ENTRANCE_EFFECTS_ENABLED:
+            if Re_m < 2300.0:
+                L_th = 0.05 * max(Re_m, 1.0) * Pr_phase * D_h
+            else:
+                L_th = 10.0 * D_h
+            dev_factor = min(1.0, L / max(L_th, 1e-12))
+        else:
+            dev_factor = 1.0
         # Combine with any user-provided serpentine enhancement (from data files), then clamp reasonably
-        Nu_raw = eNu * Nu_dean
+        Nu_raw = eNu * Nu_dean * dev_factor
         Nu = float(np.clip(Nu_raw, 3.0, 200.0))
         h_l_curr = max(1e-12, Nu * k_phase / D_h)
         # Mild boiling enhancement in two-phase region to mimic nucleate boiling effects without full Chen model
@@ -442,11 +468,7 @@ def march_annulus_multichannel(mdot_total, P_in, width, depth, A_module, W_total
         # series conduction resistance per heater area (TBRs + SiN + Si + fouling + convection)
         R_conv = (1.0 / conv_cond_per_heater_area if conv_cond_per_heater_area > 0 else 1e12)
         R_foul = FOULING_RPP if FOULING_ENABLED else 0.0
-        
-        # Base resistance excluding Si (which depends on Tw)
-        Rpp_stack_const = Rpp_tbr_mosin + Rpp_sin + Rpp_tbr_sinsi + R_foul + R_conv
-        # Initial guess for Rpp_total using fluid temp (for legacy mode or fallback)
-        Rpp_total = Rpp_stack_const + Rpp_si
+        Rpp_total = (Rpp_tbr_mosin + Rpp_sin + Rpp_tbr_sinsi + Rpp_si + R_foul + R_conv)
 
         if wall_cap_enabled:
             # Legacy cap mode (kept for compatibility). Not recommended when using physical wall model.
@@ -466,13 +488,8 @@ def march_annulus_multichannel(mdot_total, P_in, width, depth, A_module, W_total
             qpp_elec = max(0.0, qpp_heater_global)
 
             def energy_balance(Tw):
-                # Recalculate Si conductivity based on wall temperature Tw
-                k_si_Tw = get_temp_dependent_k(Tw)
-                Rpp_si_Tw = t_si / k_si_Tw if k_si_Tw > 0 else 1e12
-                Rpp_total_Tw = Rpp_stack_const + Rpp_si_Tw
-
                 # to fluid via heater stack
-                q_to_fluid = max(0.0, (Tw - T_fluid_eff) / max(1e-12, Rpp_total_Tw))
+                q_to_fluid = max(0.0, (Tw - T_fluid_eff) / max(1e-12, Rpp_total))
                 # to backside sink
                 q_back = max(0.0, (Tw - T_BASE_K) / max(1e-12, Rpp_back_total))
                 # radiation from top surface
@@ -492,11 +509,6 @@ def march_annulus_multichannel(mdot_total, P_in, width, depth, A_module, W_total
                 except Exception:
                     # Fallback (should rarely happen): assume all power to fluid
                     T_wall_local = T_fluid_eff + qpp_heater_global * Rpp_total
-
-            # Update Rpp_total with the final T_wall_local for correct heat flux calculation
-            k_si_final = get_temp_dependent_k(T_wall_local)
-            Rpp_si_final = t_si / k_si_final if k_si_final > 0 else 1e12
-            Rpp_total = Rpp_stack_const + Rpp_si_final
 
             # Once T_wall is known, only the portion to the fluid contributes to fluid heating
             qpp_to_fluid = max(0.0, (T_wall_local - T_fluid_eff) / max(1e-12, Rpp_total))
@@ -677,12 +689,7 @@ def isentropic_nozzle_performance(P1, T1, A_t, A_e, gamma=1.33, R=R_v, p_ambient
     # (Moved computation above to allow use for velocity)
 
     # Axial thrust reduction due to discharge angle (non-axial exhaust)
-    # Using planar divergence factor sin(theta)/theta instead of cos(theta)
-    if abs(theta_e_rad) < 1e-9:
-        axial_factor = 1.0
-    else:
-        axial_factor = np.sin(theta_e_rad) / theta_e_rad
-    
+    axial_factor = np.cos(theta_e_rad)
     # Thrust including pressure term; only momentum term projected axially
     F = mdot * Ve * axial_factor + (pe - p_ambient) * A_e
 
@@ -713,43 +720,20 @@ results = []
 # New: container for axial distributions and vaporization locations
 dist_rows = []
 
-# Enable debug mode for geometry verification
-DEBUG_GEOMETRY = True
-
-print("\n" + "="*80)
-print("GEOMETRY CONFIGURATION VERIFICATION")
-print("="*80)
-print(f"Channel cross-section type: RECTANGULAR")
-print(f"Fixed channel depth: {CHANNEL_DEPTH*1e6:.1f} µm")
-print(f"Channel widths to test: {[w*1e6 for w in CHANNEL_WIDTH_LIST]} µm")
-print(f"Number of parallel channels: {N_CHANNELS}")
-print(f"Channel length: {L_fixed*1e3:.2f} mm")
-print("="*80 + "\n")
-
 case_id = 1
 for heater_id in [1, 2]:
     W_heater = heater_power_from_voltage(V_applied, heater_id=heater_id)
     heater_label = f"H{heater_id}"
     print(f"\n=== Heater {heater_label} (Power={W_heater:.3f} W) ===")
-    for A_module, width in zip(As_list, width_list):
+    for A_module, r_in, r_out in zip(As_list, r_in_list, r_out_list):
         L_calc = L_fixed
-        depth = CHANNEL_DEPTH
-        
-        # Debug print for each geometry configuration (only once per width)
-        if DEBUG_GEOMETRY and heater_id == 1:  # Only print once
-            print(f"\n--- Geometry Debug for width={width*1e6:.1f} µm ---")
-        
         for nozzle_name, params in nozzle_types.items():
             mdot = MDOT_TOTAL  # total inlet mass flow stays constant
 
-            # Enable debug only for first nozzle of each geometry to avoid repetition
-            enable_debug = DEBUG_GEOMETRY and (nozzle_name == 'L') and (heater_id == 1)
-            
             x, T, P_arr, alpha, Q, x_qual, T_wall_max = march_annulus_multichannel(
-                mdot, P_INLET, width, depth, A_module, W_heater,
+                mdot, P_INLET, r_in, r_out, A_module, W_heater,
                 L=L_calc, n_channels=n_channels, N=N_SLICES, T_in=T_INLET,
-                wall_cap_enabled=WALL_CAP_ENABLED,
-                debug=enable_debug
+                wall_cap_enabled=WALL_CAP_ENABLED
             )
 
             P0 = P_arr[-1]
@@ -776,10 +760,10 @@ for heater_id in [1, 2]:
             limit_str = 'heater-limited' if util > 0.98 else 'thermal-stack-limited'
 
             A_mm2 = A_module * 1e6
-            width_um = width * 1e6
-            depth_um = depth * 1e6
+            t_wall_um = r_in * 1e6
+            D_o_um = r_out * 1e6
 
-            print(f"Case {case_id}: Heater={heater_label}, A={A_mm2:.2f} mm², W={width_um:.1f} µm, D={depth_um:.1f} µm, Nozzle={nozzle_name} (Cd={areas['Cd']:.2f}, theta={areas['theta_e_deg']:.1f}°)")
+            print(f"Case {case_id}: Heater={heater_label}, A={A_mm2:.2f} mm², t_wall={t_wall_um:.1f} µm, D_o={D_o_um:.1f} µm, Nozzle={nozzle_name} (Cd={areas['Cd']:.2f}, theta={areas['theta_e_deg']:.1f}°)")
             print(f"  P={P_in_W:.2f} W, mdot_total={mdot*1e6:.2f} mg/s, x_exit={x_qual[-1]:.3f}, alpha_exit={alpha[-1]:.3f}, mdot_noz={mdot_mgs:.2f} mg/s, choked={perf['choked']}")
             print(f"  F={F_uN:.1f} µN, Isp={Isp_s:.1f} s, p={p_bar:.3f} bar, T={T_K:.1f} K, tau={tau_uN_per_W:.1f} µN/W")
             print(f"  Q_absorbed={Q:.2f} W ({util*100:.1f}% of heater power) -> {limit_str}")
@@ -808,8 +792,8 @@ for heater_id in [1, 2]:
                 'Cd': perf['Cd'],
                 'dP_kPa': float(P_arr[0] - P_arr[-1]) / 1e3,
                 'A_mm2': A_mm2,
-                'width_um': width_um,
-                'depth_um': depth_um,
+                't_wall_um': t_wall_um,
+                'D_o_um': D_o_um,
                 'Q_absorbed_W': Q,
                 'utilization': util,
                 'T_wall_max_K': T_wall_max,
@@ -843,7 +827,7 @@ for heater_id in [1, 2]:
                 vap_end_m = float(x[np.where(mask_tp)[0][-1]])
 
             # Append per-position distribution rows for this case
-            geom_label = 'Large' if width_um >= 100.0 else 'Small'
+            geom_label = 'Large' if D_o_um >= 200.0 else 'Small'
             for ii in range(len(x)):
                 xi = float(x[ii])
                 Ti = float(T[ii])
@@ -858,8 +842,8 @@ for heater_id in [1, 2]:
                     'geom': geom_label,
                     'nozzle': nozzle_name,
                     'A_mm2': A_mm2,
-                    'width_um': width_um,
-                    'depth_um': depth_um,
+                    't_wall_um': t_wall_um,
+                    'D_o_um': D_o_um,
                     'x_m': xi,
                     'x_mm': xi * 1e3,
                     'T_K': Ti,
@@ -873,8 +857,8 @@ for heater_id in [1, 2]:
                     'vap_end_m': vap_end_m,
                     'T_wall_max_K': T_wall_max
                 })
-            # Plot and save T(x) and P(x) for this case (only for cases 1, 4, 7, 10)
-            if MATPLOTLIB_AVAILABLE and (current_case_id in (1, 4, 7, 10)):
+            # Plot and save T(x) and P(x) for this case
+            if MATPLOTLIB_AVAILABLE:
                 try:
                     os.makedirs('plots', exist_ok=True)
                     x_mm = np.array(x) * 1e3
@@ -932,10 +916,10 @@ df = pd.DataFrame(results)
 # Round and tidy columns for clearer printing
 cols_order = ['case','heater','nozzle','P_W','mdot_total_mgs','alpha_exit','x_exit','mdot_nozzle_mgs',
               'F_mN','Isp_s','p_bar','T_K','tau_mN_per_W','Me','choked','theta_deg','Cd',
-              'A_mm2','width_um','depth_um','dP_kPa','Q_absorbed_W','utilization','T_wall_max_K','dT_wall_fluid_est_K']
+              'A_mm2','t_wall_um','D_o_um','dP_kPa','Q_absorbed_W','utilization','T_wall_max_K','dT_wall_fluid_est_K']
 for c in cols_order:
     if c in df.columns:
-        if c in ['P_W','A_mm2','width_um','depth_um','dP_kPa']:
+        if c in ['P_W','A_mm2','t_wall_um','D_o_um','dP_kPa']:
             df[c] = df[c].astype(float).round(1)
         elif c in ['F_mN','tau_mN_per_W']:
             df[c] = df[c].astype(float).round(2)
@@ -953,7 +937,7 @@ if 'theta_deg' in df.columns:
     df['theta_deg'] = df['theta_deg'].astype(float).round(1)
 
 # Add a simple geometry label for readability
-df['geom'] = np.where(df['width_um'] >= 100.0, 'Large', 'Small')
+df['geom'] = np.where(df['D_o_um'] >= 200.0, 'Large', 'Small')
 
 # Order rows: Heater -> geom (Large first) -> nozzle (L,W,B) -> case
 nozzle_cat = pd.CategoricalDtype(['L','W','B'], ordered=True)
